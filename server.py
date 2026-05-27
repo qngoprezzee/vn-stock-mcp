@@ -271,6 +271,32 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["tickers"],
             },
         ),
+        types.Tool(
+            name="get_market_news",
+            description=(
+                "Crawl Vietnamese financial news sites (CafeF, Tin Nhanh Chứng Khoán, NDH) via RSS "
+                "and return recent articles that mention the stock ticker. "
+                "Complements fetch_broker_news (which pulls from vnstock/FiinGroup) with broader "
+                "editorial coverage from independent news outlets. "
+                "Use this to gauge media sentiment, spot breaking news, or find analyst commentary "
+                "not covered by broker disclosures."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticker": {
+                        "type": "string",
+                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of articles to return (default 20).",
+                        "default": 20,
+                    },
+                },
+                "required": ["ticker"],
+            },
+        ),
     ]
 
 
@@ -292,6 +318,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent | type
         return await _fetch_broker_news(arguments)
     elif name == "compare_stocks":
         return await _compare_stocks(arguments)
+    elif name == "get_market_news":
+        return await _get_market_news(arguments)
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -967,6 +995,126 @@ async def _compare_stocks(args: dict) -> list[types.TextContent]:
         for k in ("overview_error", "finance_error"):
             if k in m:
                 lines.append(f"  {m['ticker']} {k}: {m[k]}")
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+_RSS_FEEDS = [
+    ("CafeF - Thị trường CK", "https://cafef.vn/thi-truong-chung-khoan.rss"),
+    ("CafeF - Doanh nghiệp",  "https://cafef.vn/doanh-nghiep.rss"),
+    ("CafeF - Tài chính NH",  "https://cafef.vn/tai-chinh-ngan-hang.rss"),
+    ("CafeF - Đầu tư",        "https://cafef.vn/dau-tu.rss"),
+    ("VietStock",             "https://vietstock.vn/830/chung-khoan.rss"),
+    ("Tin Nhanh CK",          "https://tinnhanhchungkhoan.vn/rss/"),
+]
+
+_RSS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
+
+# Common ticker → Vietnamese company name keywords for broader matching
+_TICKER_ALIASES: dict[str, list[str]] = {
+    "VCB": ["Vietcombank"],
+    "BID": ["BIDV"],
+    "CTG": ["VietinBank"],
+    "TCB": ["Techcombank"],
+    "MBB": ["MB Bank", "Quân đội"],
+    "VPB": ["VPBank"],
+    "ACB": ["Á Châu"],
+    "VIC": ["Vingroup"],
+    "VHM": ["Vinhomes"],
+    "VNM": ["Vinamilk"],
+    "SAB": ["Sabeco"],
+    "MSN": ["Masan"],
+    "HPG": ["Hòa Phát"],
+    "MWG": ["Thế Giới Di Động"],
+    "FRT": ["FPT Retail"],
+    "PNJ": ["Phú Nhuận"],
+    "VJC": ["VietJet"],
+    "HVN": ["Vietnam Airlines"],
+    "GVR": ["Cao su Việt Nam"],
+    "GAS": ["PetroVietnam Gas"],
+    "PLX": ["Petrolimex"],
+}
+
+
+async def _fetch_one_rss(client: httpx.AsyncClient, source: str, url: str, ticker: str, keywords: list[str]) -> list[dict]:
+    import xml.etree.ElementTree as ET
+    import re
+
+    try:
+        resp = await client.get(url, timeout=10, headers=_RSS_HEADERS)
+        resp.raise_for_status()
+        # Strip non-XML control characters before parsing (some feeds have encoding issues)
+        raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', resp.text).encode("utf-8", errors="replace")
+        root = ET.fromstring(raw)
+    except Exception:
+        return []
+
+    items = []
+    for item in root.findall(".//item"):
+        title = item.findtext("title", "").strip()
+        link_el = item.find("link")
+        link = (link_el.text or "").strip() if link_el is not None else ""
+        if not link:
+            link = item.findtext("guid", "").strip()
+        pub_date = item.findtext("pubDate", "").strip()
+        description = re.sub(r"<[^>]+>", " ", item.findtext("description", ""))
+
+        haystack = f"{title} {description}".upper()
+        if any(kw.upper() in haystack for kw in keywords):
+            items.append({
+                "source": source,
+                "title": title,
+                "link": link,
+                "date": pub_date[:22] if pub_date else "",
+            })
+    return items
+
+
+async def _get_market_news(args: dict) -> list[types.TextContent]:
+    ticker = args["ticker"].upper()
+    limit = int(args.get("limit", 20))
+
+    keywords = [ticker] + _TICKER_ALIASES.get(ticker, [])
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        results = await asyncio.gather(
+            *[_fetch_one_rss(client, name, url, ticker, keywords) for name, url in _RSS_FEEDS],
+            return_exceptions=True,
+        )
+
+    seen, articles = set(), []
+    for batch in results:
+        if isinstance(batch, list):
+            for item in batch:
+                key = item["title"].lower()
+                if key not in seen:
+                    seen.add(key)
+                    articles.append(item)
+
+    articles = articles[:limit]
+
+    if not articles:
+        return [types.TextContent(
+            type="text",
+            text=(
+                f"## Market News — {ticker}\n\n"
+                f"No articles mentioning **{ticker}** found across {len(_RSS_FEEDS)} RSS feeds.\n\n"
+                "Possible reasons: ticker not in recent headlines, site blocked, or RSS temporarily unavailable.\n"
+                "Try `fetch_broker_news` for vnstock-sourced disclosures instead."
+            ),
+        )]
+
+    lines = [
+        f"## Market News — {ticker}  ({len(articles)} articles from {len(_RSS_FEEDS)} sources)\n",
+        "| Source | Date | Headline |",
+        "|---|---|---|",
+    ]
+    for a in articles:
+        title_md = f"[{a['title']}]({a['link']})" if a["link"] else a["title"]
+        lines.append(f"| {a['source']} | {a['date']} | {title_md} |")
 
     return [types.TextContent(type="text", text="\n".join(lines))]
 
