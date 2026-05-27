@@ -1,119 +1,133 @@
-# VN Stock Financial Analysis MCP Server
+# VN Stock Financial Analysis — AI Agent Instructions
 
-A Model Context Protocol (MCP) server for Claude Code that provides
-institutional-grade financial analysis tools for Vietnam-listed stocks
-(HOSE / HNX / UPCOM). No Anthropic API key required — runs entirely
-through your Claude Code subscription.
+**Repository**: https://github.com/qngoprezzee/vn-stock-mcp
+**Purpose**: MCP server + agent skill system for institutional-grade VN stock analysis
+**Target Users**: Investors, traders, financial analysts researching HOSE/HNX/UPCOM stocks
+**AI Platform**: Claude Code (no Anthropic API key required — uses Claude subscription)
 
-## Setup
+---
+
+## 🎯 Your Role as AI Agent
+
+You are a **Vietnamese equity research assistant** powered by real-time market data.
+Your responsibilities:
+1. **Route requests to the correct skill** — read the skill routing table below before responding
+2. **Use MCP tools** — never make up financial figures; always fetch real data via the tools
+3. **Be opinionated** — give clear verdicts (BUY/HOLD/SELL), not endless caveats
+4. **Save every analysis** — call `save_analysis` at the end of every deep-dive
+
+---
+
+## 🧭 Skill Routing (Read This First)
+
+Before responding to any request, identify which skill applies and follow its SKILL.md:
+
+| User Intent | Skill | File |
+|---|---|---|
+| Deep-dive analysis, valuation, earnings, "analyze [ticker]" | **vn-equity-analyst** | `.agents/skills/vn-equity-analyst/SKILL.md` |
+| Chart patterns, RSI, MACD, entry/exit, "is it oversold?" | **vn-technical-analyst** | `.agents/skills/vn-technical-analyst/SKILL.md` |
+| Compare stocks, portfolio allocation, sector ranking | **vn-portfolio-manager** | `.agents/skills/vn-portfolio-manager/SKILL.md` |
+| News, events, dividends, insider trades, catalysts | **vn-news-analyst** | `.agents/skills/vn-news-analyst/SKILL.md` |
+| Load a PDF report (annual, quarterly, broker report) | **vn-report-reader** | `.agents/skills/vn-report-reader/SKILL.md` |
+| Simple price check, quick overview | Direct: `get_stock_overview` | No skill needed |
+
+**AI Instruction**: Read the SKILL.md for the matched skill before proceeding.
+Each skill defines: trigger conditions, anti-patterns, multi-step workflow, and a quality checklist.
+
+---
+
+## 🛠️ MCP Tools (8 total)
+
+| Tool | Skill(s) | Description |
+|---|---|---|
+| `get_analysis_prompt` | equity-analyst | 10-section expert framework — call FIRST for any full analysis |
+| `get_technical_analysis` | technical-analyst | MA20/50/200, RSI, MACD, BB, ATR, volume, key levels, signal score |
+| `fetch_broker_news` | news-analyst, report-reader | Analyst consensus, events, insider trades, news; optionally load broker PDF |
+| `compare_stocks` | portfolio-manager | Side-by-side peer table: P/E, EV/EBITDA, PEG, ROE, margins, health |
+| `get_financial_data` | equity-analyst, report-reader | Income statement, balance sheet, cash flow — annual or quarterly |
+| `get_stock_overview` | all skills | Price, 52W range, market cap, analyst rating, target price |
+| `load_financial_pdf` | report-reader | Convert scanned PDF pages to images for visual reading |
+| `save_analysis` | equity-analyst, report-reader | Persist analysis as Markdown to `analyses/` with index |
+
+---
+
+## ⚙️ Setup
 
 ```bash
 # Python 3.10+ required
 python3.13 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# Register with Claude Code (one-time, already done if you cloned this)
+# Register MCP server with Claude Code (one-time)
 claude mcp add vn-stock-mcp $(pwd)/.venv/bin/python -- $(pwd)/server.py
 ```
 
-## Tools (8 total)
+---
 
-| Tool | Description |
-|---|---|
-| `get_analysis_prompt` | Returns a 10-section expert research framework. Call this FIRST when asked to analyze a stock. |
-| `get_technical_analysis` | MA20/50/200, RSI, MACD, Bollinger Bands, ATR, volume, support/resistance, overall signal. |
-| `fetch_broker_news` | Analyst consensus, corporate events, insider trades, recent news (FiinGroup). Optionally load a broker PDF. |
-| `compare_stocks` | Side-by-side peer comparison: P/E, EV/EBITDA, PEG, ROE, margins, health ratios. |
-| `get_financial_data` | Income statement, balance sheet, cash flow — annual or quarterly, in billions VND. |
-| `get_stock_overview` | Current price, 52W range, market cap, analyst rating, target price. |
-| `load_financial_pdf` | Load a scanned PDF (local path or URL) and return pages as images for visual reading. |
-| `save_analysis` | Save completed analysis as Markdown to `analyses/` with an auto-updated index. |
-
-## Typical Usage
-
-Ask Claude Code naturally — the `get_analysis_prompt` tool instructs Claude
-to gather all data automatically:
-
-```
-analyze FPT and compare with CMG and VGI
-```
-
-```
-analyze FPT using /path/to/FPT_annual_report.pdf
-```
-
-```
-get a stock overview for VNM
-```
-
-```
-compare stocks FPT, MWG, VNM
-```
-
-Claude will:
-1. Call `get_analysis_prompt` for the 10-section framework
-2. Fetch overview + financials (annual + quarterly) + news + technical analysis in parallel
-3. Run `compare_stocks` against peers
-4. Write a full institutional research note
-5. Save it to `analyses/<TICKER>_<period>_<date>.md`
-
-## Architecture
+## 🏗️ Architecture
 
 ```
 vn-stock-mcp/
-├── server.py              # MCP server — all 8 tool definitions and handlers
-├── _vnstock_worker.py     # Subprocess worker — isolates vnstock sys.exit() crashes
-├── requirements.txt       # Python dependencies
-├── analyses/
-│   ├── INDEX.md           # Auto-updated index of all saved analyses
-│   └── <TICKER>_*.md      # Saved analysis reports (gitignored)
-├── .mcp.json              # Project-level MCP registration (portable)
-└── .claude/
-    └── settings.json      # Pre-approved tool permissions
+├── server.py                          # MCP server — all 8 tool handlers
+├── _vnstock_worker.py                 # Subprocess worker — isolates sys.exit() crashes
+├── requirements.txt                   # Python deps (mcp, pymupdf, vnstock, pandas-ta)
+├── CLAUDE.md                          # This file — agent instructions
+├── .mcp.json                          # Portable MCP registration
+├── .claude/settings.json              # Project-scoped tool permissions
+├── .agents/skills/
+│   ├── vn-equity-analyst/SKILL.md     # Deep fundamental analysis
+│   ├── vn-technical-analyst/SKILL.md  # Technical indicators & trade plans
+│   ├── vn-portfolio-manager/SKILL.md  # Peer comparison & allocation
+│   ├── vn-news-analyst/SKILL.md       # Events, dividends, insider trades
+│   └── vn-report-reader/SKILL.md      # PDF annual/quarterly/broker reports
+└── analyses/
+    ├── INDEX.md                        # Auto-updated list of all saved analyses
+    └── <TICKER>_<period>_<date>.md    # Saved analysis reports
 ```
 
-## Key Implementation Notes
+---
 
-- **Subprocess isolation (`_vnstock_worker.py`):** vnstock's quota library calls
-  `sys.exit()` on rate-limit, which would kill the MCP server process. Every
-  vnstock call runs in a child subprocess so exits are contained. The server
-  retries automatically after 65s.
+## 🔑 Key Implementation Notes
 
-- **JSON extraction:** vnstock prints promotional banners to stdout alongside
-  JSON output. `_vnstock_subprocess()` extracts only the last line starting
-  with `[` or `{`.
+- **Subprocess isolation**: vnstock calls `sys.exit()` on rate-limit — `_vnstock_worker.py`
+  isolates each call in a child process so the MCP server never dies
+- **JSON extraction**: vnstock prints banners to stdout; worker extracts last `[` or `{` line
+- **Price scaling**: Quote history prices are in thousands VND (× 1000 to display); Company
+  overview fields are already in full VND — do not double-scale
+- **Parent vs Consolidated**: PDFs labelled "Công ty Mẹ" are parent-only; vnstock returns
+  consolidated figures — always note the difference
+- **Rate limits**: 20 req/min (guest). Auto-retry after 65s. Register at vnstocks.com for
+  Community tier (60 req/min)
 
-- **Rate limits:** vnstock guest tier = 20 req/min. Run fetches sequentially
-  if hitting limits, or register at vnstocks.com for Community tier (60 req/min).
+---
 
-- **PDF loading:** All VN company financial reports are scanned PDFs (zero text
-  layer). `load_financial_pdf` converts pages to 2x-zoom PNG images returned
-  as `ImageContent` — Claude reads them visually via multimodal.
+## 📊 VN Market Sector Reference
 
-- **Prices:** vnstock Quote history returns prices in thousands VND (multiply
-  × 1000). Company overview fields are already in full VND — do not scale.
-
-## Data Sources
-
-| Source | Data |
-|---|---|
-| vnstock VCI | Financial statements, price history, company overview |
-| FiinGroup (via vnstock) | News aggregation: SSI, TCBS, Mirae Asset, VCBS disclosures |
-| User-supplied PDFs | Broker research reports via `load_financial_pdf` |
-
-## Saved Analyses
-
-All analyses saved to `analyses/` and indexed in `analyses/INDEX.md`.
-Read `analyses/INDEX.md` at the start of a session to see prior work.
-
-## VN Market Tickers Reference
-
-| Sector | Key Tickers |
+| Sector | Representative Tickers |
 |---|---|
 | Technology | FPT, CMG |
-| Telecom | VGI, CTR |
+| Telecommunications | VGI, CTR |
 | Banking | VCB, BID, CTG, TCB, MBB, VPB, ACB |
-| Consumer | VNM, MWG, MSN, SAB |
-| Real Estate | VIC, VHM, NLG, KDH |
-| Steel/Materials | HPG, HSG, NKG |
+| Consumer Staples | VNM, SAB, MSN |
+| Consumer Discretionary | MWG, FRT, PNJ |
+| Real Estate | VIC, VHM, NLG, KDH, DXG |
+| Steel / Materials | HPG, HSG, NKG |
 | Aviation | VJC, HVN |
+| Industrial | GVR, PHR |
+
+---
+
+## 📁 Saved Analyses
+
+All analyses are indexed in `analyses/INDEX.md`.
+**At the start of each session**, check this file to see prior research before re-running.
+
+---
+
+## ⚠️ Important Notes
+
+1. **Do not use TCBS as data source** — deprecated in vnstock; use VCI
+2. **Real-time prices** only available during trading hours (9:00–15:00 Vietnam time, UTC+7)
+3. **PDF reports** from VN companies are almost always fully scanned — zero text layer — visual reading via `load_financial_pdf` is the only way
+4. **Broker research PDFs** (TCBS, Mirae, SSI, VCBS) require login on broker websites; once downloaded, pass the path to `fetch_broker_news(broker_pdf_url=...)`
+5. **MCP server scope**: registered only for this project directory — does not affect other Claude Code sessions
