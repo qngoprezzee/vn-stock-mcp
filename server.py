@@ -272,6 +272,32 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="get_macro_data",
+            description=(
+                "Fetch live Vietnamese macroeconomic data: USD/VND and major currency exchange rates "
+                "from Vietcombank, plus the SBV base interest rate context. "
+                "Use this when analyzing currency risk, import/export companies, or macro environment."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="get_commodity_prices",
+            description=(
+                "Fetch live commodity prices relevant to Vietnam: SJC gold (miếng), BTMC gold, "
+                "silver, and key precious metals in VND per lượng. "
+                "Use this for gold-related stocks (PNJ, SJC), inflation analysis, or macro context."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        types.Tool(
             name="get_market_news",
             description=(
                 "Crawl Vietnamese financial news sites (CafeF, Tin Nhanh Chứng Khoán, NDH) via RSS "
@@ -318,6 +344,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent | type
         return await _fetch_broker_news(arguments)
     elif name == "compare_stocks":
         return await _compare_stocks(arguments)
+    elif name == "get_macro_data":
+        return await _get_macro_data(arguments)
+    elif name == "get_commodity_prices":
+        return await _get_commodity_prices(arguments)
     elif name == "get_market_news":
         return await _get_market_news(arguments)
     else:
@@ -995,6 +1025,120 @@ async def _compare_stocks(args: dict) -> list[types.TextContent]:
         for k in ("overview_error", "finance_error"):
             if k in m:
                 lines.append(f"  {m['ticker']} {k}: {m[k]}")
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+_VCB_FX_URL  = "https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyGia/pXML.aspx?b=10"
+_BTMC_URL    = "http://api.btmc.vn/api/BTMCAPI/getpricebtmc?key=3kd8ub1llcg9t45hnoh8hmn7t5kc2v"
+
+_KEY_CURRENCIES = ["USD", "EUR", "JPY", "CNY", "GBP", "AUD", "SGD", "KRW", "THB", "HKD"]
+
+# BTMC commodity names to display labels
+_BTMC_PRODUCTS = {
+    "VÀNG MIẾNG SJC":                  "Vàng SJC (miếng)",
+    "VÀNG MIẾNG VRTL":                 "Vàng Rồng Thăng Long",
+    "TRANG SỨC VÀNG RỒNG THĂNG LONG 999.9": "Vàng trang sức BTMC 999.9",
+    "NHẪN TRÒN TRƠN":                  "Nhẫn tròn trơn",
+    "VÀNG NGUYÊN LIỆU":                "Vàng nguyên liệu (thị trường)",
+    "BẠC MIẾNG PHÚ QUÝ Ag 999 1 LƯỢNG": "Bạc Phú Quý (1 lượng)",
+}
+
+
+async def _get_macro_data(_args: dict) -> list[types.TextContent]:
+    import xml.etree.ElementTree as ET
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as c:
+            resp = await c.get(_VCB_FX_URL, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Failed to fetch exchange rates: {e}")]
+
+    dt = root.findtext("DateTime", "N/A")
+    rates = {}
+    for node in root.findall("Exrate"):
+        code = node.get("CurrencyCode", "").strip()
+        rates[code] = {
+            "name": node.get("CurrencyName", "").strip().title(),
+            "buy":  node.get("Buy", "-").replace(",", ""),
+            "transfer": node.get("Transfer", "-").replace(",", ""),
+            "sell": node.get("Sell", "-").replace(",", ""),
+        }
+
+    lines = [
+        f"## Tỷ Giá Ngoại Tệ — Vietcombank",
+        f"*Cập nhật: {dt}*\n",
+        "| Currency | Name | Buy | Transfer | Sell |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for code in _KEY_CURRENCIES:
+        if code in rates:
+            r = rates[code]
+            def _fmt(v):
+                try: return f"{float(v):,.2f}"
+                except: return v
+            lines.append(f"| **{code}** | {r['name']} | {_fmt(r['buy'])} | {_fmt(r['transfer'])} | {_fmt(r['sell'])} |")
+
+    lines += [
+        "",
+        "**Đơn vị:** VND / 1 đơn vị ngoại tệ (trừ JPY, KRW = VND / 100 đơn vị)",
+        "*Nguồn: Vietcombank — chỉ mang tính tham khảo*",
+    ]
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+async def _get_commodity_prices(_args: dict) -> list[types.TextContent]:
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as c:
+            resp = await c.get(_BTMC_URL, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+        items = resp.json()["DataList"]["Data"]
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Failed to fetch commodity prices: {e}")]
+
+    # Keep only the first (most recent) occurrence of each product keyword
+    seen: dict[str, dict] = {}
+    for item in items:
+        row = item["@row"]
+        name = item.get(f"@n_{row}", "").strip()
+        date = item.get(f"@d_{row}", "")
+        buy  = item.get(f"@pb_{row}", "")
+        sell = item.get(f"@ps_{row}", "")
+
+        # Match against known products (partial name match)
+        for key, label in _BTMC_PRODUCTS.items():
+            if key in name.upper() or name.upper() in key:
+                if label not in seen:
+                    seen[label] = {"buy": buy, "sell": sell, "date": date, "name": name}
+                break
+
+    if not seen:
+        return [types.TextContent(type="text", text="No commodity data returned from BTMC.")]
+
+    # Use latest date from first item
+    sample_date = next(iter(seen.values()))["date"]
+
+    lines = [
+        "## Giá Hàng Hóa — BTMC",
+        f"*Cập nhật: {sample_date}*  |  Đơn vị: VND / lượng (37.5g)\n",
+        "| Loại | Mua vào | Bán ra |",
+        "|---|---:|---:|",
+    ]
+
+    def _fmt(v: str) -> str:
+        try: return f"{int(v):,}"
+        except: return v or "—"
+
+    for label, data in seen.items():
+        lines.append(f"| {label} | {_fmt(data['buy'])} | {_fmt(data['sell'])} |")
+
+    lines += [
+        "",
+        "*Nguồn: BTMC (Bảo Tín Minh Châu)*",
+    ]
 
     return [types.TextContent(type="text", text="\n".join(lines))]
 

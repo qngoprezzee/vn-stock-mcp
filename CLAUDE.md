@@ -36,14 +36,16 @@ Each skill defines: trigger conditions, anti-patterns, multi-step workflow, and 
 
 ---
 
-## 🛠️ MCP Tools (9 total)
+## 🛠️ MCP Tools (11 total)
 
 | Tool | Skill(s) | Description |
 |---|---|---|
 | `get_analysis_prompt` | equity-analyst | 10-section expert framework — call FIRST for any full analysis |
 | `get_technical_analysis` | technical-analyst | MA20/50/200, RSI, MACD, BB, ATR, volume, key levels, signal score |
 | `fetch_broker_news` | news-analyst, report-reader | Analyst consensus, events, insider trades, news (via vnstock/FiinGroup); optionally load broker PDF |
-| `get_market_news` | news-analyst | RSS crawler: CafeF, Tin Nhanh CK, NDH, VietStock — editorial coverage filtered by ticker |
+| `get_market_news` | news-analyst | RSS crawler: CafeF, Tin Nhanh CK, VietStock — editorial coverage filtered by ticker |
+| `get_macro_data` | equity-analyst | Live exchange rates (USD/VND, EUR, JPY, CNY…) from Vietcombank XML |
+| `get_commodity_prices` | equity-analyst | Live gold (SJC, BTMC) and silver prices in VND/lượng from BTMC |
 | `compare_stocks` | portfolio-manager | Side-by-side peer table: P/E, EV/EBITDA, PEG, ROE, margins, health |
 | `get_financial_data` | equity-analyst, report-reader | Income statement, balance sheet, cash flow — annual or quarterly |
 | `get_stock_overview` | all skills | Price, 52W range, market cap, analyst rating, target price |
