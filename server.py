@@ -422,11 +422,12 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="get_dcf_valuation",
             description=(
-                "Calculate a discounted cash flow (DCF) intrinsic value for a VN-listed stock. "
-                "Fetches historical free cash flow, projects it under bull/base/bear scenarios, "
-                "and returns per-share intrinsic value vs. current price with margin of safety. "
-                "Use for Phase 2 absolute valuation alongside P/E and EV/EBITDA multiples. "
-                "Defaults: 12% discount rate (VN hurdle), 5% terminal growth (VN GDP estimate)."
+                "Triangulated intrinsic value for a VN-listed stock combining (1) DCF with "
+                "bull/base/bear scenarios, (2) peer-relative valuation via median P/E + P/B + EV/EBITDA, "
+                "and (3) a 5×5 WACC × terminal-growth sensitivity grid. Returns a blended implied "
+                "price weighted by sector (e.g. banks lean relative-heavy; staples lean DCF-heavy) "
+                "plus an opinionated UNDER/FAIR/OVERVALUED verdict. "
+                "Defaults: 12% WACC, 5% terminal growth, default peer set per sector."
             ),
             inputSchema={
                 "type": "object",
@@ -464,6 +465,11 @@ async def list_tools() -> list[types.Tool]:
                         "type": "integer",
                         "description": "Years to project FCF (default 5).",
                         "default": 5,
+                    },
+                    "peers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional explicit peer tickers for relative valuation. If omitted, default peer set for the sector is used.",
                     },
                 },
                 "required": ["ticker"],
@@ -2173,6 +2179,152 @@ async def _get_economy_news(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text="\n".join(lines))]
 
 
+# Sector lookup uses lowercase substring match against vnstock's sector strings
+# (which vary: "Banks" vs "Banking", "Real Estate" vs "Real Estate Development", etc.)
+# Key = lowercase substring to look for in vnstock sector string.
+
+_SECTOR_PEER_SET: list[tuple[str, list[str]]] = [
+    ("technolog",          ["FPT", "CMG", "VGI", "ITD", "ELC"]),
+    ("bank",               ["VCB", "BID", "CTG", "TCB", "MBB", "ACB", "STB", "VPB", "HDB"]),
+    ("real estate",        ["VIC", "VHM", "NLG", "KDH", "DXG", "DIG"]),
+    ("steel",              ["HPG", "HSG", "NKG"]),
+    ("material",           ["HPG", "HSG", "DGC"]),
+    ("staple",             ["VNM", "SAB", "MSN"]),
+    ("discretionary",      ["MWG", "FRT", "PNJ"]),
+    ("retail",             ["MWG", "FRT", "PNJ"]),
+    ("aviation",           ["VJC", "HVN"]),
+    ("airline",            ["VJC", "HVN"]),
+    ("industrial",         ["GVR", "PHR"]),
+    ("energy",             ["GAS", "PLX", "BSR"]),
+    ("oil",                ["GAS", "PLX", "BSR", "PVD", "PVS"]),
+    ("telecom",            ["VGI", "CTR"]),
+]
+
+_VALUATION_WEIGHTS: list[tuple[str, dict[str, float]]] = [
+    ("bank",               {"dcf": 0.1, "relative": 0.9}),  # DCF nonsensical for banks (deposit flows in OCF)
+    ("insurance",          {"dcf": 0.1, "relative": 0.9}),
+    ("real estate",        {"dcf": 0.2, "relative": 0.8}),  # NAV-based ideally
+    ("aviation",           {"dcf": 0.2, "relative": 0.8}),
+    ("airline",            {"dcf": 0.2, "relative": 0.8}),
+    ("steel",              {"dcf": 0.3, "relative": 0.7}),  # cyclical
+    ("material",           {"dcf": 0.3, "relative": 0.7}),
+    ("energy",             {"dcf": 0.3, "relative": 0.7}),
+    ("oil",                {"dcf": 0.3, "relative": 0.7}),
+    ("discretionary",      {"dcf": 0.4, "relative": 0.6}),
+    ("retail",             {"dcf": 0.4, "relative": 0.6}),
+    ("staple",             {"dcf": 0.6, "relative": 0.4}),  # durable franchise → DCF more reliable
+    ("technolog",          {"dcf": 0.5, "relative": 0.5}),
+    ("telecom",            {"dcf": 0.5, "relative": 0.5}),
+    ("industrial",         {"dcf": 0.5, "relative": 0.5}),
+]
+_DEFAULT_WEIGHTS = {"dcf": 0.5, "relative": 0.5}
+
+# Sectors where DCF is structurally unreliable — surface a strong warning
+_DCF_UNRELIABLE_KEYS = ["bank", "insurance", "real estate"]
+
+
+def _lookup_sector_peers(sector: str) -> list[str]:
+    s = (sector or "").lower()
+    for key, peers in _SECTOR_PEER_SET:
+        if key in s:
+            return list(peers)
+    return []
+
+
+def _lookup_sector_weights(sector: str) -> dict[str, float]:
+    s = (sector or "").lower()
+    for key, weights in _VALUATION_WEIGHTS:
+        if key in s:
+            return dict(weights)
+    return dict(_DEFAULT_WEIGHTS)
+
+
+def _is_dcf_unreliable(sector: str) -> bool:
+    s = (sector or "").lower()
+    return any(k in s for k in _DCF_UNRELIABLE_KEYS)
+
+
+async def _fetch_peer_multiples(target: str, peers: list[str]) -> dict:
+    """Fetch P/E, P/B, EV/EBITDA for each peer in parallel. Return medians."""
+    other_peers = [p for p in peers if p.upper() != target.upper()]
+    if not other_peers:
+        return {"peers_used": [], "pe": None, "pb": None, "ev_ebitda": None}
+
+    metrics_list = await asyncio.gather(*[
+        _fetch_metrics_for_ticker(t, "year") for t in other_peers
+    ])
+
+    pe_values:        list[float] = []
+    pb_values:        list[float] = []
+    ev_ebitda_values: list[float] = []
+    used:             list[str]   = []
+
+    for m in metrics_list:
+        has_any = False
+        if m.get("pe") and 0 < m["pe"] < 200:  # filter outliers
+            pe_values.append(m["pe"])
+            has_any = True
+        if m.get("pb") and 0 < m["pb"] < 20:
+            pb_values.append(m["pb"])
+            has_any = True
+        if m.get("ev_ebitda") and 0 < m["ev_ebitda"] < 100:
+            ev_ebitda_values.append(m["ev_ebitda"])
+            has_any = True
+        if has_any:
+            used.append(m["ticker"])
+
+    def _median(xs: list[float]) -> float | None:
+        if not xs:
+            return None
+        s = sorted(xs)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+    return {
+        "peers_used":  used,
+        "pe":          _median(pe_values),
+        "pb":          _median(pb_values),
+        "ev_ebitda":   _median(ev_ebitda_values),
+        "n_pe":        len(pe_values),
+        "n_pb":        len(pb_values),
+        "n_ev_ebitda": len(ev_ebitda_values),
+    }
+
+
+def _compute_sensitivity_grid(
+    base_fcf: float, shares: float, projection_years: int, growth_rate: float,
+    wacc_center: float, g_center: float,
+) -> dict:
+    """5×5 sensitivity grid of WACC × terminal-growth → IV per share."""
+    wacc_steps = [wacc_center - 0.02, wacc_center - 0.01, wacc_center, wacc_center + 0.01, wacc_center + 0.02]
+    g_steps    = [max(g_center - 0.02, 0.01), max(g_center - 0.01, 0.01), g_center, g_center + 0.01, g_center + 0.02]
+
+    grid: list[list[float | None]] = []
+    for wacc in wacc_steps:
+        row: list[float | None] = []
+        for g in g_steps:
+            if wacc <= g:
+                row.append(None)  # infinite terminal value
+                continue
+            fcf = base_fcf
+            npv = 0.0
+            for yr in range(1, projection_years + 1):
+                fcf *= (1 + growth_rate)
+                npv += fcf / (1 + wacc) ** yr
+            terminal_fcf   = fcf * (1 + g)
+            terminal_value = terminal_fcf / (wacc - g)
+            npv           += terminal_value / (1 + wacc) ** projection_years
+            iv_per_share   = npv / shares
+            row.append(iv_per_share)
+        grid.append(row)
+
+    return {
+        "wacc_steps": wacc_steps,
+        "g_steps":    g_steps,
+        "grid":       grid,
+    }
+
+
 async def _get_dcf_valuation(args: dict) -> list[types.TextContent]:
     ticker: str = args["ticker"].upper()
     discount_rate: float = float(args.get("discount_rate", 12.0)) / 100
@@ -2181,6 +2333,7 @@ async def _get_dcf_valuation(args: dict) -> list[types.TextContent]:
     base_growth: float = float(args.get("base_growth", 12.0)) / 100
     bear_growth: float = float(args.get("bear_growth", 5.0)) / 100
     projection_years: int = int(args.get("projection_years", 5))
+    peers_override: list[str] | None = args.get("peers")
 
     if discount_rate <= terminal_growth:
         return [types.TextContent(type="text", text="Error: discount_rate must exceed terminal_growth to avoid an infinite terminal value.")]
@@ -2189,14 +2342,16 @@ async def _get_dcf_valuation(args: dict) -> list[types.TextContent]:
         import pandas as pd
         from datetime import date
 
-        inc_json, cf_json, ov_json, hist_json = await asyncio.gather(
+        inc_json, bal_json, cf_json, ov_json, hist_json = await asyncio.gather(
             _vnstock_subprocess("income_statement", {"ticker": ticker, "period": "year"}),
-            _vnstock_subprocess("cash_flow", {"ticker": ticker, "period": "year"}),
+            _vnstock_subprocess("balance_sheet",    {"ticker": ticker, "period": "year"}),
+            _vnstock_subprocess("cash_flow",        {"ticker": ticker, "period": "year"}),
             _vnstock_subprocess("company_overview", {"ticker": ticker}),
-            _vnstock_subprocess("quote_history", {"ticker": ticker, "start": "2026-01-01", "end": date.today().isoformat()}),
+            _vnstock_subprocess("quote_history",    {"ticker": ticker, "start": "2026-01-01", "end": date.today().isoformat()}),
         )
 
         income   = pd.DataFrame(json.loads(inc_json))   if inc_json.strip().startswith("[")  else pd.DataFrame()
+        balance  = pd.DataFrame(json.loads(bal_json))   if bal_json.strip().startswith("[")  else pd.DataFrame()
         cashflow = pd.DataFrame(json.loads(cf_json))    if cf_json.strip().startswith("[")   else pd.DataFrame()
         ov_rows  = json.loads(ov_json)
         hist_rows = json.loads(hist_json)
@@ -2314,25 +2469,128 @@ async def _get_dcf_valuation(args: dict) -> list[types.TextContent]:
             calc_scenario(bear_growth, f"Bear  (+{bear_growth*100:.0f}%/yr)"),
         ]
 
-        weighted_iv  = scenarios[0]["iv_per_share"] * 0.3 + scenarios[1]["iv_per_share"] * 0.5 + scenarios[2]["iv_per_share"] * 0.2
-        weighted_mos = (weighted_iv - current_price) / current_price * 100
+        weighted_dcf_iv  = scenarios[0]["iv_per_share"] * 0.3 + scenarios[1]["iv_per_share"] * 0.5 + scenarios[2]["iv_per_share"] * 0.2
+
+        # ── Relative valuation via peer multiples ────────────────────────────
+        ov = ov_rows[0] if ov_rows and isinstance(ov_rows, list) else {}
+        sector = str(ov.get("sector", "")).strip()
+        company_name = str(ov.get("organ_short_name") or ov.get("organ_name", ticker))
+
+        # Target's own metrics for applying peer multiples.
+        # Latest year — try several statement items because bank income statements
+        # don't have "net_sales" (they use interest_income, net_interest_income, etc.)
+        latest_year = None
+        for probe_item in ("net_sales", "eps_basic_vnd", "attributable_to_parent_company",
+                           "net_profit_loss_after_tax", "operating_profit_loss",
+                           "interest_income_net", "interest_income"):
+            years = sorted(get_item_values(income, probe_item).keys(), reverse=True)
+            if years:
+                latest_year = years[0]
+                break
+        target_eps    = eps_vals.get(latest_year) if latest_year else None
+        target_profit = net_profit_vals.get(latest_year) if latest_year else None
+        op_profit_vals = get_item_values(income, "operating_profit_loss")
+        dep_vals       = get_item_values(cashflow, "depreciation_and_amortization")
+        equity_vals    = get_item_values(balance, "owners_equity")
+        st_borrow_vals = get_item_values(balance, "short_term_borrowings")
+        lt_borrow_vals = get_item_values(balance, "long_term_borrowings")
+        cash_vals      = get_item_values(balance, "cash_and_cash_equivalents")
+
+        target_op_profit = op_profit_vals.get(latest_year) if latest_year else None
+        target_dep       = dep_vals.get(latest_year) if latest_year else None
+        target_ebitda    = (target_op_profit + target_dep) if (target_op_profit and target_dep) else target_op_profit
+        target_equity    = equity_vals.get(latest_year) if latest_year else None
+        target_net_debt  = ((st_borrow_vals.get(latest_year) or 0) +
+                            (lt_borrow_vals.get(latest_year) or 0) -
+                            (cash_vals.get(latest_year) or 0)) if latest_year else 0
+
+        # Peer set selection (allow user override)
+        peers = peers_override if peers_override else _lookup_sector_peers(sector)
+        peers = [p for p in peers if p.upper() != ticker.upper()]
+        peer_multiples = await _fetch_peer_multiples(ticker, peers) if peers else {"peers_used": [], "pe": None, "pb": None, "ev_ebitda": None}
+
+        # Implied prices from each multiple
+        implied_pe = target_eps * peer_multiples["pe"] if (target_eps and peer_multiples.get("pe")) else None
+        implied_pb = (peer_multiples["pb"] * target_equity / shares) if (target_equity and peer_multiples.get("pb") and shares) else None
+        implied_ev_ebitda = None
+        if target_ebitda and target_ebitda > 0 and peer_multiples.get("ev_ebitda") and shares:
+            implied_ev    = peer_multiples["ev_ebitda"] * target_ebitda
+            implied_equity = implied_ev - target_net_debt
+            implied_ev_ebitda = implied_equity / shares
+
+        implied_relatives = [v for v in (implied_pe, implied_pb, implied_ev_ebitda) if v and v > 0]
+        relative_iv = sum(implied_relatives) / len(implied_relatives) if implied_relatives else None
+
+        # ── Blended (triangulated) implied price ─────────────────────────────
+        weight_profile = _lookup_sector_weights(sector)
+        w_dcf = weight_profile["dcf"]
+        w_rel = weight_profile["relative"]
+
+        # When DCF is structurally unreliable AND relative valuation also missing,
+        # we have no defensible blended estimate — flag it instead of inventing one.
+        dcf_unreliable = _is_dcf_unreliable(sector)
+        insufficient_data = relative_iv is None and dcf_unreliable
+
+        if insufficient_data:
+            blended_iv = None
+            blend_explained = (
+                f"INSUFFICIENT DATA — DCF is unreliable for {sector or 'this sector'} and "
+                f"no peer relative valuation could be computed (target metrics or peer multiples missing)"
+            )
+            w_dcf, w_rel = 0.0, 0.0
+        elif relative_iv is None:
+            blended_iv = weighted_dcf_iv
+            blend_explained = "DCF only (relative valuation unavailable — no peer data)"
+            w_dcf, w_rel = 1.0, 0.0
+        else:
+            total_w = w_dcf + w_rel
+            w_dcf, w_rel = w_dcf / total_w, w_rel / total_w
+            blended_iv = weighted_dcf_iv * w_dcf + relative_iv * w_rel
+            blend_explained = f"DCF × {w_dcf:.2f} + Relative × {w_rel:.2f}"
+
+        blended_mos = ((blended_iv - current_price) / current_price * 100) if blended_iv else None
+
+        # ── Sensitivity grid (WACC × terminal growth) ────────────────────────
+        sensitivity = _compute_sensitivity_grid(
+            base_fcf=base_value, shares=shares, projection_years=projection_years,
+            growth_rate=base_growth,
+            wacc_center=discount_rate, g_center=terminal_growth,
+        )
+
+        # ── Build markdown output ────────────────────────────────────────────
+        weighted_dcf_mos = (weighted_dcf_iv - current_price) / current_price * 100
+        relative_mos = (relative_iv - current_price) / current_price * 100 if relative_iv else None
 
         lines = [
-            f"## DCF Valuation — {ticker}",
-            f"*Metric: {use_metric} | WACC: {discount_rate*100:.0f}% | Terminal growth: {terminal_growth*100:.0f}%*\n",
+            f"## Triangulated Valuation — {ticker}",
+            f"*Company: {company_name} | Sector: {sector or 'unknown'}*",
+            f"*Metric: {use_metric} | WACC: {discount_rate*100:.0f}% | Terminal growth: {terminal_growth*100:.0f}%*",
+            "",
+        ]
+
+        if _is_dcf_unreliable(sector):
+            lines += [
+                f"> ⚠️  **DCF is structurally unreliable for {sector}.** Earnings are cyclically distorted by",
+                f"> provisioning timing (banks) or land bank revaluation (real estate). Output below leans",
+                f"> heavily on relative valuation by design (see weight profile).",
+                "",
+            ]
+
+        lines += [
             "### Historical Base Metric (VND)",
             "| Year | Value (B VND) |",
             "|---|---:|",
         ]
         for yr in sorted(fcf_by_year.keys(), reverse=True)[:5]:
             lines.append(f"| {yr} | {fcf_by_year[yr]/1e9:,.1f}B |")
-
         if hist_growth_rate is not None:
-            lines.append(f"\n*Historical CAGR: {hist_growth_rate*100:.1f}% — use as guide for growth scenario inputs*")
+            lines.append(f"\n*Historical CAGR: {hist_growth_rate*100:.1f}% — guide for growth scenario inputs*")
 
         lines += [
-            "\n### Intrinsic Value vs. Current Price",
-            f"**Current Price: {current_price:,.0f} VND**\n",
+            "",
+            f"### Method 1: DCF",
+            f"**Current Price: {current_price:,.0f} VND**",
+            "",
             "| Scenario | FCF Growth | Intrinsic Value | Margin of Safety | Verdict |",
             "|---|---:|---:|---:|---|",
         ]
@@ -2341,10 +2599,102 @@ async def _get_dcf_valuation(args: dict) -> list[types.TextContent]:
             verdict = "✅ Undervalued" if mos > 15 else "⚠️ Fair value" if mos > -10 else "❌ Overvalued"
             lines.append(f"| {s['label']} | {s['growth']*100:.0f}% | {s['iv_per_share']:,.0f} VND | {mos:+.1f}% | {verdict} |")
 
+        lines.append(f"\n**DCF probability-weighted IV: {weighted_dcf_iv:,.0f} VND** ({weighted_dcf_mos:+.1f}%) — 30% bull / 50% base / 20% bear")
+
+        # Relative section
         lines += [
-            f"\n**Probability-weighted IV: {weighted_iv:,.0f} VND** (30% bull / 50% base / 20% bear)",
-            f"**Weighted margin of safety: {weighted_mos:+.1f}%**",
-            f"\n### Base Case Projection ({projection_years}Y)",
+            "",
+            "### Method 2: Relative (peer multiples)",
+        ]
+        if not peer_multiples["peers_used"]:
+            lines.append(f"*No peer data available for sector `{sector or '(unknown)'}`. Skipping relative method.*")
+        else:
+            lines += [
+                f"*Peers used ({len(peer_multiples['peers_used'])}): {', '.join(peer_multiples['peers_used'])}*",
+                "",
+                "| Multiple | Target | Peer Median | Implied Price | vs Current |",
+                "|---|---:|---:|---:|---:|",
+            ]
+            # Target's own multiples
+            target_market_cap = shares * current_price
+            own_pe        = (current_price / target_eps) if target_eps and target_eps > 0 else None
+            own_pb        = (target_market_cap / target_equity) if target_equity and target_equity > 0 else None
+            own_ev_ebitda = ((target_market_cap + target_net_debt) / target_ebitda) if target_ebitda and target_ebitda > 0 else None
+
+            def _row(label: str, own: float | None, peer: float | None, implied: float | None):
+                if implied is None:
+                    return f"| {label} | {f'{own:.1f}x' if own else '—'} | {f'{peer:.1f}x' if peer else '—'} | — | — |"
+                mos = (implied - current_price) / current_price * 100
+                return f"| {label} | {f'{own:.1f}x' if own else '—'} | {f'{peer:.1f}x' if peer else '—'} | {implied:,.0f} VND | {mos:+.1f}% |"
+
+            lines.append(_row("P/E",        own_pe,        peer_multiples["pe"],        implied_pe))
+            lines.append(_row("P/B",        own_pb,        peer_multiples["pb"],        implied_pb))
+            lines.append(_row("EV/EBITDA",  own_ev_ebitda, peer_multiples["ev_ebitda"], implied_ev_ebitda))
+
+            if relative_iv:
+                lines.append(f"\n**Relative average IV: {relative_iv:,.0f} VND** ({relative_mos:+.1f}%) — mean of valid implied prices")
+
+        # SOTP placeholder
+        lines += [
+            "",
+            "### Method 3: SOTP (sum-of-the-parts)",
+            "*Not implemented yet — single-segment treatment assumed. Adds value mainly for conglomerates with 2+ distinct businesses.*",
+        ]
+
+        # Blended
+        lines += [
+            "",
+            "### Blended Implied Price",
+            f"*Formula: {blend_explained}*",
+            "",
+        ]
+        if blended_iv is None:
+            lines += [
+                f"**Verdict: ⚪ INSUFFICIENT DATA**",
+                f"*Add explicit peers via the `peers` parameter, or use a P/B-only screen for this sector.*",
+            ]
+        else:
+            verdict_label = (
+                "✅ MATERIALLY UNDERVALUED" if blended_mos > 25 else
+                "🟢 UNDERVALUED"             if blended_mos > 10 else
+                "🟡 FAIR VALUE"              if blended_mos > -10 else
+                "🟠 OVERVALUED"              if blended_mos > -25 else
+                "🔴 MATERIALLY OVERVALUED"
+            )
+            lines += [
+                f"**Blended IV: {blended_iv:,.0f} VND**",
+                f"**Margin of safety vs current ({current_price:,.0f} VND): {blended_mos:+.1f}%**",
+                f"**Verdict: {verdict_label}**",
+            ]
+
+        # Sensitivity grid
+        lines += [
+            "",
+            f"### Sensitivity Grid — WACC × Terminal Growth",
+            f"*Cells show IV per share (VND) at base FCF growth = {base_growth*100:.0f}%. Bold marks your chosen assumption.*",
+            "",
+            "| WACC ↓ \\ g → | " + " | ".join(f"**{g*100:.0f}%**" for g in sensitivity["g_steps"]) + " |",
+            "|---|" + "---:|" * len(sensitivity["g_steps"]),
+        ]
+        for i, wacc in enumerate(sensitivity["wacc_steps"]):
+            row_cells = []
+            for j, g in enumerate(sensitivity["g_steps"]):
+                val = sensitivity["grid"][i][j]
+                if val is None:
+                    cell = "—"
+                else:
+                    cell = f"{val:,.0f}"
+                # Mark the user-chosen cell
+                if abs(wacc - discount_rate) < 1e-6 and abs(g - terminal_growth) < 1e-6:
+                    cell = f"**[{cell}]**"
+                row_cells.append(cell)
+            wacc_label = f"**{wacc*100:.0f}%**" if abs(wacc - discount_rate) < 1e-6 else f"{wacc*100:.0f}%"
+            lines.append(f"| {wacc_label} | " + " | ".join(row_cells) + " |")
+
+        # Base case projection (kept from original)
+        lines += [
+            "",
+            f"### Base Case Cash Flow Projection ({projection_years}Y)",
             "| Year | Projected FCF (B) | PV (B) |",
             "|---|---:|---:|",
         ]
@@ -2355,13 +2705,15 @@ async def _get_dcf_valuation(args: dict) -> list[types.TextContent]:
             f"| Terminal Value | — | {base['pv_terminal']/1e9:,.1f}B |",
             f"| **Total NPV** | | **{base['total_npv']/1e9:,.1f}B** |",
             "",
-            f"*Shares outstanding: ~{shares/1e6:.0f}M*",
-            "*⚠️ DCF is highly sensitive to growth and discount rate assumptions. Use alongside P/E, EV/EBITDA, and peer comparison — not as a standalone signal.*",
+            f"*Shares outstanding: ~{shares/1e6:.0f}M | Sector weight profile: DCF {w_dcf:.0%} / Relative {w_rel:.0%}*",
+            "",
+            "*Triangulation reduces single-method brittleness — but valuation remains sensitive to inputs.",
+            "Sanity-check assumptions against historical CAGR + the sensitivity grid above.*",
         ]
         text = "\n".join(lines)
 
     except Exception as e:
-        text = f"DCF valuation failed for {ticker}: {e}"
+        text = f"Triangulated valuation failed for {ticker}: {e}"
 
     return [types.TextContent(type="text", text=text)]
 
