@@ -2,14 +2,15 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, TrendingUp, Calculator, Activity, FileText, Sun, Scale } from "lucide-react";
+import { LayoutDashboard, TrendingUp, Calculator, Activity, FileText, Sun, Scale, Target } from "lucide-react";
 
 const nav = [
   { href: "/",              label: "Dashboard",      icon: LayoutDashboard },
-  { href: "/brief",         label: "Morning Brief",  icon: Sun },
-  { href: "/screener",      label: "Quality Screen", icon: TrendingUp },
-  { href: "/position-sizer",label: "Position Sizer", icon: Calculator },
-  { href: "/thesis",        label: "New Thesis",     icon: FileText },
+  { href: "/brief",         label: "Brief",          icon: Sun },
+  { href: "/screener",      label: "Screen",         icon: TrendingUp },
+  { href: "/valuation",     label: "Valuation",      icon: Target },
+  { href: "/position-sizer",label: "Sizer",          icon: Calculator },
+  { href: "/thesis",        label: "Thesis",         icon: FileText },
   { href: "/compare",       label: "Compare",        icon: Scale },
   { href: "/performance",   label: "Performance",    icon: Activity },
 ];
