@@ -1,0 +1,144 @@
+{
+  "_comment": "Curated starter URLs for the knowledge base. Run: python -m knowledge.pipelines.ingest_url --registry knowledge/registry.json",
+  "_principle": "Karpathy-style — better to ingest 100 articles from 10 high-signal sources than 5000 from random crawling. Add to this file deliberately.",
+
+  "sources": [
+
+    {
+      "_group": "Investopedia — concept encyclopedia (free, well-structured)",
+      "category": "articles",
+      "source_name": "Investopedia",
+      "language": "en",
+      "authors": [],
+      "urls": [
+        "https://www.investopedia.com/terms/r/returnoninvestmentcapital.asp",
+        "https://www.investopedia.com/terms/d/dcf.asp",
+        "https://www.investopedia.com/terms/p/price-earningsratio.asp",
+        "https://www.investopedia.com/terms/e/ev-ebitda.asp",
+        "https://www.investopedia.com/terms/f/freecashflow.asp",
+        "https://www.investopedia.com/terms/r/roe.asp",
+        "https://www.investopedia.com/terms/m/marginofsafety.asp",
+        "https://www.investopedia.com/terms/c/cashconversioncycle.asp",
+        "https://www.investopedia.com/terms/d/dupontanalysis.asp",
+        "https://www.investopedia.com/terms/a/accruals.asp",
+        "https://www.investopedia.com/terms/m/moat.asp",
+        "https://www.investopedia.com/terms/p/portercompetition.asp",
+        "https://www.investopedia.com/terms/k/kellycriterion.asp",
+        "https://www.investopedia.com/terms/p/positionsizing.asp",
+        "https://www.investopedia.com/terms/r/risk-return-tradeoff.asp",
+        "https://www.investopedia.com/terms/c/capm.asp",
+        "https://www.investopedia.com/terms/w/wacc.asp",
+        "https://www.investopedia.com/terms/g/gordongrowthmodel.asp",
+        "https://www.investopedia.com/terms/t/terminalvalue.asp",
+        "https://www.investopedia.com/terms/v/valueinvesting.asp"
+      ]
+    },
+
+    {
+      "_group": "Warren Buffett — annual letters (free, foundational, copyright safe to store locally)",
+      "category": "books",
+      "source_name": "Berkshire Hathaway Letters",
+      "language": "en",
+      "authors": ["Warren Buffett"],
+      "urls": [
+        "https://www.berkshirehathaway.com/letters/2023ltr.pdf",
+        "https://www.berkshirehathaway.com/letters/2022ltr.pdf",
+        "https://www.berkshirehathaway.com/letters/2021ltr.pdf",
+        "https://www.berkshirehathaway.com/letters/2020ltr.pdf",
+        "https://www.berkshirehathaway.com/letters/2019ltr.pdf"
+      ]
+    },
+
+    {
+      "_group": "Howard Marks — Oaktree memos (free, masterful on cycles & risk)",
+      "category": "blogs",
+      "source_name": "Oaktree Capital — Howard Marks Memos",
+      "language": "en",
+      "authors": ["Howard Marks"],
+      "urls": [
+        "https://www.oaktreecapital.com/insights/memo/the-most-important-thing",
+        "https://www.oaktreecapital.com/insights/memo/sea-change",
+        "https://www.oaktreecapital.com/insights/memo/further-thoughts-on-sea-change"
+      ]
+    },
+
+    {
+      "_group": "Aswath Damodaran — Stern NYU (free valuation textbook + papers)",
+      "category": "papers",
+      "source_name": "Aswath Damodaran (NYU Stern)",
+      "language": "en",
+      "authors": ["Aswath Damodaran"],
+      "urls": [
+        "https://pages.stern.nyu.edu/~adamodar/pdfiles/papers/younggrowth.pdf",
+        "https://pages.stern.nyu.edu/~adamodar/pdfiles/papers/intrinsic.pdf",
+        "https://pages.stern.nyu.edu/~adamodar/pdfiles/papers/cfsurvey.pdf"
+      ]
+    },
+
+    {
+      "_group": "Michael Mauboussin — research essays (free, world-class on capital allocation + base rates)",
+      "category": "papers",
+      "source_name": "Counterpoint Global — Michael Mauboussin",
+      "language": "en",
+      "authors": ["Michael Mauboussin"],
+      "urls": [
+        "https://www.morganstanley.com/im/publication/insights/articles/article_basesratesandsegmentation_us.pdf"
+      ]
+    },
+
+    {
+      "_group": "Matt Levine — Money Stuff (Bloomberg Opinion, free)",
+      "category": "blogs",
+      "source_name": "Bloomberg Opinion — Matt Levine",
+      "language": "en",
+      "authors": ["Matt Levine"],
+      "urls": [
+        "https://www.bloomberg.com/opinion/articles/2023-04-13/credit-suisse-was-too-old-to-fail"
+      ]
+    },
+
+    {
+      "_group": "Reuters — free financial news",
+      "category": "articles",
+      "source_name": "Reuters Finance",
+      "language": "en",
+      "authors": [],
+      "urls": [
+        "https://www.reuters.com/markets/asia/"
+      ]
+    },
+
+    {
+      "_group": "Marc Rubinstein — Net Interest (paid Substack but free archive items)",
+      "category": "blogs",
+      "source_name": "Net Interest — Marc Rubinstein",
+      "language": "en",
+      "authors": ["Marc Rubinstein"],
+      "urls": []
+    },
+
+    {
+      "_group": "World Bank — Vietnam country reports (macro context)",
+      "category": "regulatory",
+      "source_name": "World Bank — Vietnam",
+      "language": "en",
+      "authors": [],
+      "urls": [
+        "https://www.worldbank.org/en/country/vietnam/overview"
+      ]
+    },
+
+    {
+      "_group": "Wikipedia — neutral reference on key topics (use sparingly, only definitional)",
+      "category": "articles",
+      "source_name": "Wikipedia",
+      "language": "en",
+      "authors": [],
+      "urls": [
+        "https://en.wikipedia.org/wiki/Free_cash_flow",
+        "https://en.wikipedia.org/wiki/Discounted_cash_flow",
+        "https://en.wikipedia.org/wiki/Margin_of_safety_(financial)"
+      ]
+    }
+  ]
+}
