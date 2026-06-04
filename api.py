@@ -288,6 +288,17 @@ async def knowledge_daily_brief_read(date: str) -> dict[str, Any]:
     return {"status": "missing", "path": "", "content": ""}
 
 
+@app.get("/api/knowledge/glossary")
+async def knowledge_glossary() -> dict[str, Any]:
+    """Return the curated concept glossary for valuation terms (DCF, WACC, P/E, etc.)."""
+    import json as _json
+    from pathlib import Path as _P
+    path = _P(__file__).parent / "knowledge" / "wiki" / "concepts" / "glossary.json"
+    if not path.exists():
+        return {"version": 0, "concepts": {}}
+    return _json.loads(path.read_text(encoding="utf-8"))
+
+
 @app.get("/api/knowledge/corpus-stats")
 async def knowledge_corpus_stats() -> dict[str, Any]:
     """Snapshot of the corpus — count by category, top tickers, latest ingest."""

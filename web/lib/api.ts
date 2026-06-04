@@ -212,3 +212,24 @@ export const knowledgeCorpusStats = () =>
     by_category: Record<string, number>;
     top_sources: Record<string, number>;
   }>("/api/knowledge/corpus-stats");
+
+export type GlossaryConcept = {
+  name: string;
+  category: string;
+  definition: string;
+  formula?: string;
+  key_quote?: {
+    text: string;
+    author: string;
+    source_id: string | null;
+    context: string;
+  };
+  when_to_use?: string;
+  common_pitfalls?: string[];
+};
+
+export const knowledgeGlossary = () =>
+  getJSON<{
+    version: number;
+    concepts: Record<string, GlossaryConcept>;
+  }>("/api/knowledge/glossary");

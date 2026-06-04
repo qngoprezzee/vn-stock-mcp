@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { stockDCF } from "@/lib/api";
 import { MarkdownBlock } from "@/components/MarkdownBlock";
+import { GlossaryPanel } from "@/components/GlossaryPanel";
 import { Calculator, RefreshCw, AlertCircle, Target } from "lucide-react";
 
 export default function ValuationPage() {
@@ -171,9 +172,29 @@ export default function ValuationPage() {
       )}
 
       {mutation.data && (
-        <section className="bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-800 p-6 shadow-sm">
-          <MarkdownBlock text={mutation.data.text} />
-        </section>
+        <>
+          <section className="bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-800 p-6 shadow-sm">
+            <MarkdownBlock text={mutation.data.text} />
+          </section>
+
+          <GlossaryPanel
+            title="What's behind these numbers?"
+            conceptKeys={[
+              "triangulation",
+              "dcf",
+              "fcf",
+              "intrinsic_value",
+              "wacc",
+              "terminal_growth",
+              "peer_relative",
+              "pe_ratio",
+              "pb_ratio",
+              "ev_ebitda",
+              "sensitivity_grid",
+              "margin_of_safety",
+            ]}
+          />
+        </>
       )}
     </div>
   );

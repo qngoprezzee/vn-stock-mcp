@@ -1,0 +1,222 @@
+{
+  "_comment": "Hand-curated glossary of valuation concepts with quotes from real ingested sources. Source IDs are valid against knowledge/manifest.json. Future enhancement: replace static quotes with on-demand retrieval via find_passages.",
+  "version": 1,
+  "concepts": {
+    "dcf": {
+      "name": "Discounted Cash Flow (DCF)",
+      "category": "valuation_method",
+      "definition": "A method that estimates the value of an investment by projecting its future cash flows and discounting them back to today using a required rate of return. The intuition: a dollar tomorrow is worth less than a dollar today.",
+      "formula": "PV = Σ FCF_t / (1 + WACC)^t + TerminalValue / (1 + WACC)^N",
+      "key_quote": {
+        "text": "Discounted cash flow analysis is widely used in investment finance, real estate development, corporate financial management, and patent valuation. Terminal value often represents a large share of total value and is highly sensitive to growth and discount rate assumptions.",
+        "author": "Wikipedia",
+        "source_id": "wikipedia_2026-06-04_8015c45e",
+        "context": "Wikipedia — Discounted cash flow"
+      },
+      "when_to_use": "Best for mature businesses with predictable cash flows. Unreliable for banks (deposit flows distort OCF), pre-revenue companies (no cash flow yet), and deep cyclicals (one-year FCF misleading).",
+      "common_pitfalls": [
+        "Terminal value often >70% of total NPV — and most sensitive to assumptions",
+        "Tiny changes in WACC or terminal growth cause huge swings — see the sensitivity grid",
+        "Garbage-in-garbage-out: projection accuracy decays past 3-5 years"
+      ]
+    },
+    "fcf": {
+      "name": "Free Cash Flow (FCF)",
+      "category": "input_metric",
+      "definition": "The cash a business generates after paying for working capital and capital expenditures. It's what's actually available to creditors and shareholders. The metric DCF discounts.",
+      "formula": "FCF = Operating Cash Flow − Capital Expenditures",
+      "key_quote": {
+        "text": "Free cash flow is the amount by which a business's operating cash flow exceeds its working capital needs and expenditures on fixed assets. It is that portion of cash flow that can be extracted from a company and distributed to creditors and securities holders without causing issues in its operations.",
+        "author": "Wikipedia",
+        "source_id": "wikipedia_2026-06-04_6a46a1bc",
+        "context": "Wikipedia — Free cash flow"
+      },
+      "when_to_use": "Universal — but watch for capex distortion: a company in heavy investment mode may show low FCF temporarily while building durable assets.",
+      "common_pitfalls": [
+        "FCF can be negative during investment phases (e.g. FPT's overseas push)",
+        "Doesn't capture acquisitions — for serial acquirers, look at 'FCF minus M&A'",
+        "Banks: 'FCF' includes deposit inflows, which is nonsense for equity valuation"
+      ]
+    },
+    "intrinsic_value": {
+      "name": "Intrinsic Value",
+      "category": "valuation_concept",
+      "definition": "The discounted value of cash a business will produce over its remaining life. Different from market price (which reflects sentiment) and book value (which reflects historical cost). Two analysts working from the same data will produce different intrinsic values — this irreducible subjectivity is a feature, not a bug.",
+      "formula": "IV = sum of discounted future free cash flows",
+      "key_quote": {
+        "text": "Calculations of intrinsic value are far from precise. Consequently, neither of us feels any urgency to buy an estimated $1 of value for a very real 95 cents.",
+        "author": "Warren Buffett",
+        "source_id": "berkshire-hathaway-letters_2026-06-04_525aa6d3",
+        "context": "2019 Berkshire Hathaway shareholder letter"
+      },
+      "when_to_use": "The foundation concept beneath every valuation method. DCF, P/E, P/B are all attempts to estimate intrinsic value through different lenses — triangulating is more honest than picking one.",
+      "common_pitfalls": [
+        "Intrinsic value is an estimate, not a number — express confidence with a range",
+        "Buffett: he buys when market price is materially below intrinsic value, not just slightly",
+        "Beware false precision — quoting IV to 4 decimal places implies false certainty"
+      ]
+    },
+    "wacc": {
+      "name": "Weighted Average Cost of Capital (WACC) / Discount Rate",
+      "category": "input_assumption",
+      "definition": "The blended cost of a company's financing (equity + debt), used as the discount rate in DCF. Higher WACC = future cash flows are worth less today = lower intrinsic value.",
+      "formula": "WACC = (E/V) × Re + (D/V) × Rd × (1 − Tc)",
+      "key_quote": {
+        "text": "For Vietnamese equities, a 12% WACC is a common default — built from a risk-free rate of ~3-4% (Vietnamese 10-year government bonds) plus an equity risk premium of ~7-8% reflecting EM volatility, currency risk, and lower disclosure quality versus developed markets.",
+        "author": "VN equity convention",
+        "source_id": null,
+        "context": "Project convention — see GUIDE.md"
+      },
+      "when_to_use": "Default WACC for VN large-caps: 11-13%. Use higher (14-16%) for small-caps or highly leveraged companies. Use lower (9-11%) for VN blue-chip banks (VCB, BID).",
+      "common_pitfalls": [
+        "A 1% change in WACC moves intrinsic value by 10-20% — see sensitivity grid",
+        "Don't overfit WACC to get the answer you want — pick a reasonable number then test sensitivity",
+        "WACC is not the same as 'expected return' — it's the minimum return the business must earn to justify its capital structure"
+      ]
+    },
+    "terminal_growth": {
+      "name": "Terminal Growth Rate",
+      "category": "input_assumption",
+      "definition": "The growth rate assumed beyond the explicit projection period — i.e., the rate the company is expected to compound at forever. By definition, must be lower than long-run GDP growth (or the company would eventually become bigger than the economy).",
+      "formula": "Terminal Value = FCF_N × (1 + g) / (WACC − g)",
+      "key_quote": {
+        "text": "Terminal value often represents a large share of total value and is highly sensitive to growth and discount rate assumptions.",
+        "author": "Wikipedia",
+        "source_id": "wikipedia_2026-06-04_8015c45e",
+        "context": "Wikipedia — Discounted cash flow"
+      },
+      "when_to_use": "For VN: terminal growth of 4-6% is conventional (matches long-run VN GDP estimates). Never set higher than the country's nominal GDP growth (~7-8% for VN).",
+      "common_pitfalls": [
+        "Setting terminal growth too close to WACC blows up the model (denominator → 0)",
+        "5% terminal growth in a 12% WACC model is normal; 8% would be aggressive",
+        "Terminal value typically 60-80% of total NPV — your DCF is mostly an opinion about year-6-onward"
+      ]
+    },
+    "pe_ratio": {
+      "name": "P/E Ratio (Price-to-Earnings)",
+      "category": "valuation_multiple",
+      "definition": "Current share price divided by earnings per share. The most common quick valuation gauge. Tells you how many years of current earnings the market is paying upfront.",
+      "formula": "P/E = Price / EPS",
+      "key_quote": {
+        "text": "Benjamin Graham suggested to look at unpopular or neglected companies with low P/E and P/B ratios.",
+        "author": "Wikipedia",
+        "source_id": "wikipedia_2026-06-04_12fffd87",
+        "context": "Wikipedia — Margin of safety (Graham's screening criteria)"
+      },
+      "when_to_use": "Comparable across companies in the same sector. Less useful for cyclicals (peak-cycle earnings make valuation look cheap) and pre-profit companies (denominator is zero or negative).",
+      "common_pitfalls": [
+        "Earnings are accounting figures — easier to manipulate than cash flow",
+        "VN bank P/E around 6-10x is sector-typical, not undervaluation",
+        "VN tech / consumer staples often trade 18-25x — that's the franchise premium"
+      ]
+    },
+    "pb_ratio": {
+      "name": "P/B Ratio (Price-to-Book)",
+      "category": "valuation_multiple",
+      "definition": "Market value divided by accounting book value (shareholders' equity). Measures how much premium investors are paying over net asset value.",
+      "formula": "P/B = Market Cap / Shareholders' Equity",
+      "key_quote": {
+        "text": "Benjamin Graham suggested to look at unpopular or neglected companies with low P/E and P/B ratios. One should also analyze financial statements and footnotes to understand whether companies have hidden assets that are potentially unnoticed by the market.",
+        "author": "Wikipedia",
+        "source_id": "wikipedia_2026-06-04_12fffd87",
+        "context": "Wikipedia — Margin of safety"
+      },
+      "when_to_use": "Critical for banks (assets ARE the business), real estate developers (NAV-based), and insurance. Less useful for asset-light businesses (tech, services) where book value understates true economic value.",
+      "common_pitfalls": [
+        "Tech / IT services companies trade 2-5x P/B by design — they have little book equity",
+        "VN bank P/B 1.5-2.5x is normal; below 1x signals real distress or genuine value",
+        "Book equity can be distorted by goodwill, deferred tax, or accounting choices"
+      ]
+    },
+    "ev_ebitda": {
+      "name": "EV/EBITDA",
+      "category": "valuation_multiple",
+      "definition": "Enterprise Value divided by EBITDA (earnings before interest, taxes, depreciation, amortization). A capital-structure-neutral version of P/E — useful when comparing companies with different debt levels.",
+      "formula": "EV = Market Cap + Total Debt − Cash;  EBITDA = Operating Profit + D&A",
+      "key_quote": {
+        "text": "Comparable across capital structures — a leveraged company and an unleveraged one with the same operating performance will have similar EV/EBITDA but different P/E.",
+        "author": "Project convention",
+        "source_id": null,
+        "context": "Standard valuation convention"
+      },
+      "when_to_use": "Cross-border comparisons, leveraged companies, M&A. Not meaningful for banks (no EBITDA concept).",
+      "common_pitfalls": [
+        "EBITDA ignores capex — bad for capital-intensive cyclicals (steel, airlines)",
+        "EBITDA is not cash flow — beware of treating it as such",
+        "Negative EBITDA (early-stage companies) makes the metric undefined"
+      ]
+    },
+    "margin_of_safety": {
+      "name": "Margin of Safety",
+      "category": "investing_principle",
+      "definition": "The buffer between intrinsic value and the price you pay. Coined by Benjamin Graham in 1934 in *Security Analysis*. Protects against analyst error, unforeseen events, and the inherent imprecision of valuation.",
+      "formula": "Margin of Safety = (Intrinsic Value − Price) / Price",
+      "key_quote": {
+        "text": "You have to have the knowledge to enable you to make a very general estimate about the value of the underlying business. But you do not cut it close... When you build a bridge, you insist it can carry 30,000 pounds, but you only drive 10,000 pound trucks across it. And that same principle works in investing.",
+        "author": "Warren Buffett",
+        "source_id": "wikipedia_2026-06-04_12fffd87",
+        "context": "Quoted in Wikipedia — Margin of safety (financial)"
+      },
+      "when_to_use": "Always. The valuation tool's UNDERVALUED / FAIR / OVERVALUED verdict is essentially a margin-of-safety threshold. Common thresholds: high-quality businesses need >10% MoS; speculative ones need >50%.",
+      "common_pitfalls": [
+        "A small margin of safety on a confident estimate beats a large margin on a guess",
+        "MoS doesn't help if your intrinsic value estimate is wrong by 2x",
+        "VN-specific: typical 20-30% MoS is appropriate given thinner disclosure + currency risk"
+      ]
+    },
+    "sensitivity_grid": {
+      "name": "Sensitivity Analysis",
+      "category": "valuation_technique",
+      "definition": "A table showing how intrinsic value changes as key assumptions vary. The 5×5 grid in this tool shows IV across WACC (±2%) and terminal growth (±2%). Reveals how brittle (or robust) the central estimate is.",
+      "formula": "Recompute DCF for each (WACC, g) pair in the grid",
+      "key_quote": {
+        "text": "Terminal value often represents a large share of total value and is highly sensitive to growth and discount rate assumptions.",
+        "author": "Wikipedia",
+        "source_id": "wikipedia_2026-06-04_8015c45e",
+        "context": "Wikipedia — Discounted cash flow"
+      },
+      "when_to_use": "Every time you do DCF. Single-point estimates without sensitivity are intellectually dishonest about how much you actually know.",
+      "common_pitfalls": [
+        "A wide range in the sensitivity grid means your DCF is essentially a coin flip — fall back to relative valuation",
+        "A narrow range (e.g. all cells within ±15%) means your assumptions are robust",
+        "Don't use sensitivity to find the assumption that gives you the answer you want"
+      ]
+    },
+    "triangulation": {
+      "name": "Triangulated Valuation",
+      "category": "valuation_method",
+      "definition": "Combining multiple valuation methods (DCF + peer-relative + SOTP) into a blended implied price. Forces multiple lenses on the same business — reduces single-method brittleness.",
+      "formula": "Blended IV = w_DCF × DCF_IV + w_Relative × Relative_IV + w_SOTP × SOTP_IV",
+      "key_quote": {
+        "text": "One number from one method is intellectually dishonest. Triangulating with sector-appropriate weights surfaces disagreement between methods — and disagreement is information.",
+        "author": "Project convention",
+        "source_id": null,
+        "context": "This project's valuation methodology"
+      },
+      "when_to_use": "The default approach. Especially valuable when DCF and relative valuation disagree — that disagreement tells you something about the company.",
+      "common_pitfalls": [
+        "Don't blend methods that don't apply (e.g. DCF for banks)",
+        "Equal weights aren't always right — bias toward the method that fits the business model",
+        "When methods disagree by >2x, investigate why before averaging"
+      ]
+    },
+    "peer_relative": {
+      "name": "Relative Valuation",
+      "category": "valuation_method",
+      "definition": "Apply peer median multiples (P/E, P/B, EV/EBITDA) to the target company's metrics to derive an implied price. Anchors the valuation in what the market is currently paying for similar businesses.",
+      "formula": "Implied Price = Peer Median Multiple × Target's per-share metric",
+      "key_quote": {
+        "text": "When the market is collectively wrong about a sector (entire industries get cheap or expensive), relative valuation will tell you the stock is 'fair' while DCF says it's mispriced. That's not a bug in relative valuation — it's a reflection of the market's mood.",
+        "author": "Project convention (Damodaran-style framing)",
+        "source_id": "aswath-damodaran-nyu-stern_2026-06-04_1ff8737c",
+        "context": "Adapted from Damodaran's valuation work"
+      },
+      "when_to_use": "Always combine with absolute methods (DCF). Especially useful for banks, real estate, cyclicals — sectors where DCF is structurally unreliable.",
+      "common_pitfalls": [
+        "Peer median is meaningless if peer set is wrong — confirm peers are genuinely comparable",
+        "In VN, 'sector peer' often means 5-10 companies — small N makes median noisy",
+        "Foreign-room-capped stocks trade at premium to peers — don't mark them down for it"
+      ]
+    }
+  }
+}
