@@ -6,7 +6,9 @@ A living document tracking what's built, what's next, and the decisions behind b
 
 ## Current state — one-line summary
 
-**Working system**: MCP server (25 tools) + Next.js web UI + Karpathy-style knowledge layer with 478 ingested sources. Ready to embed + index + add RAG search.
+**Working system**: MCP server (28 tools) + Next.js web UI (9 pages) + Karpathy-style knowledge layer (478 sources) + triangulated valuation + news-price correlation + curated glossary. Ready to embed + index + add RAG search.
+
+**Last major addition (2026-06-04):** News-price correlation model with keyword sentiment scoring — see `knowledge/KICKOFF.md` K-NPC. Three upgrade paths queued as K19 (LLM sentiment, ~$0.40), K20 (theme tagging), K21 (sector aggregate).
 
 ---
 

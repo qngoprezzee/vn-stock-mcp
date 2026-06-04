@@ -20,6 +20,8 @@ What to actually *do* with the ingested corpus. Pick any one when you have a fre
 
 **Pipelines available to add more:** `ingest_rss`, `ingest_url`, `ingest_pdf`, `ingest_epub`, `ingest_md`, `ingest_image` (OCR), `ingest_folder` (dispatcher), `ingest_paste` (paywalled content)
 
+**Already shipped (Tier 2):** K6 Daily Brief, K7 Buffett concept extraction, K8 Cross-reference engine, K9 Per-ticker thesis context, K-NPC News-to-price correlation
+
 ---
 
 ## Status legend
@@ -415,6 +417,122 @@ thesis_context(
 
 ---
 
+## K-NPC — News-to-price correlation ✅ SHIPPED 2026-06-04
+
+**What:** For a given ticker + lookback window, compute cross-correlation between news flow (volume + sentiment) and daily returns at lags −2 / −1 / 0 / +1 / +2 days. Tells you whether news LEADS price (information edge), REACTS to price (noise), or is uncorrelated.
+
+**Shipped artifacts:**
+- `knowledge/lib/sentiment.py` — keyword-based scorer (VN + EN), ~70% accuracy
+- `server.py` — MCP tool `correlate_news_to_price(ticker, lookback_days)`
+- `api.py` — `/api/stock/news-correlation` endpoint
+- `web/app/news-impact/page.tsx` — new web page in main nav
+- requirements.txt: `+ scipy>=1.13.0` (for pearsonr with p-values)
+
+**Verified output (FPT, 90 days, 7 articles):** Weak signal lag −1 r=+0.185 vs lag +1 r=+0.089 → "news leads price" verdict, but p-values insignificant given small N. Honest caveats surfaced in output.
+
+**Three upgrade paths queued below as K19/K20/K21.**
+
+---
+
+## K19 — LLM-scored sentiment at ingest time 📋
+
+**What:** Replace the keyword sentiment in `knowledge/lib/sentiment.py` with Claude Haiku 4.5 scoring done once at ingest time. Each article gets a `sentiment_llm` field in frontmatter (score in [-1, +1] + a 1-sentence reason). `correlate_news_to_price` uses this when available, falls back to keyword otherwise.
+
+**Why:** Keyword sentiment hits ~70% on obvious cases; LLM catches sarcasm, context, ambiguity (~95%). The Bloomberg headline *"Bank stocks tumble as 'positive' inflation report disappoints"* gets keyword-scored positive (matches "positive") but LLM would correctly score it negative. For correlation analysis where signal is weak, that 25-point accuracy gap is the difference between noise and edge.
+
+**Files to build:**
+| File | Purpose |
+|---|---|
+| `knowledge/pipelines/score_sentiment_llm.py` | Reads articles without `sentiment_llm` in frontmatter, calls Claude API, writes score back to file |
+| Modify each `ingest_*.py` | Add optional hook so new articles get LLM-scored at ingest |
+| `knowledge/lib/sentiment.py` | Update `score_sentiment` to prefer LLM score when present in frontmatter |
+
+**Cost estimate:**
+- 1 article ≈ 500 tokens in + 50 tokens out via Haiku 4.5
+- Haiku pricing: $1/M input, $5/M output → ~$0.0008 per article
+- Backfill 478 articles: **~$0.40 one-time**
+- Steady state (refresh daily, 50 new articles): **~$1.20/month**
+
+**Acceptance:**
+- [ ] Running `python -m knowledge.pipelines.score_sentiment_llm` scores all articles without `sentiment_llm` field
+- [ ] Each article gains: `sentiment_llm: <float>` and `sentiment_reason: "<one sentence>"` in frontmatter
+- [ ] `correlate_news_to_price` produces noticeably different verdicts on at least 2-3 known sarcasm-heavy headlines (manual spot-check)
+- [ ] Tool indicates which sentiment source it used (keyword vs LLM) in output
+
+**Effort:** ~3 hours (pipeline + API integration + frontmatter merge + sentiment.py update)
+**Depends on:** Anthropic API key (or could go through Claude Code subscription via a different pattern — research needed)
+
+---
+
+## K20 — Theme tagging on ingested articles 📋
+
+**What:** Beyond binary pos/neg sentiment, classify each article into themes: `earnings`, `regulatory`, `foreign-flow`, `dividend`, `management-change`, `m&a`, `analyst-rating`, `macro`, `sector-trend`. Add `themes: [...]` to each article's frontmatter.
+
+**Why:** Sentiment alone is too coarse. The same -0.5 sentiment score can mean very different things — a regulatory crackdown vs. a missed earnings vs. foreign selling. Theme tagging makes the news-correlation tool more useful: "earnings-themed news leads price by 1 day with r=+0.4; foreign-flow news lags by 1 day with r=+0.2" is far more actionable than aggregate sentiment.
+
+**Files to build:**
+| File | Purpose |
+|---|---|
+| `knowledge/lib/themes.py` | Theme taxonomy (10-15 categories) + keyword lexicons for MVP, LLM-classifier for v2 |
+| `knowledge/pipelines/tag_themes.py` | Reads articles, writes `themes: [...]` to frontmatter |
+| `server.py` (extend) | `correlate_news_to_price` accepts optional `theme_filter` parameter |
+
+**Approach:**
+- **MVP**: keyword-based, similar to sentiment (~70% accuracy)
+- **v2**: LLM classification at ingest, multi-label output (an article can be both `earnings` + `analyst-rating`)
+- **Cost (v2)**: same envelope as K19 — ~$0.0008/article via Haiku
+
+**Acceptance:**
+- [ ] Every ingested article has a `themes: [...]` field
+- [ ] `correlate_news_to_price(ticker, theme_filter=["earnings"])` returns correlation conditioned on earnings news only
+- [ ] Web UI exposes theme filter as a multi-select on `/news-impact`
+
+**Effort:** ~4 hours (taxonomy 1hr, keyword pipeline 1hr, server.py integration 1hr, web UI 1hr)
+**Depends on:** Same Anthropic API gating as K19 if you want LLM v2. MVP works without it.
+
+---
+
+## K21 — Sector-aggregate / cross-ticker correlation 📋
+
+**What:** Extend `correlate_news_to_price` to support a sector mode that aggregates news + returns across all tickers in a sector. Example: for VN Banking, sum daily news volume across VCB/BID/CTG/TCB/MBB/ACB and correlate with the sector's median return. SBV rate decisions, banking-sector regulatory news, foreign flows hit all bank stocks together — sector-level analysis has much higher statistical power.
+
+**Why:** A single ticker like FPT gets 7 articles in 90 days — sample size too small for confident correlation. The same 7 articles across 9 banks would be 63 — enough for real statistical signal. Sector-level events are also the most likely to LEAD price (regulatory news, rate moves, currency events).
+
+**Files to build:**
+| File | Purpose |
+|---|---|
+| `server.py` (extend) | `correlate_news_to_price` accepts `sector="Banks"` instead of `ticker` |
+| Reuse `_SECTOR_PEER_SET` from valuation | Same peer sets already curated for triangulation |
+| Web UI: `/news-impact` | Add sector toggle alongside ticker |
+
+**MCP tool signature change:**
+```python
+correlate_news_to_price(
+    ticker: str | None = None,
+    sector: str | None = None,  # mutually exclusive with ticker
+    lookback_days: int = 90,
+)
+```
+
+**Approach:**
+1. Identify sector peer tickers
+2. Aggregate articles per trading day (sum across all sector tickers, dedup by content_hash)
+3. Compute sector return as median of constituent returns (or equal-weighted average)
+4. Run the same cross-correlation analysis at lags −2..+2
+
+**Acceptance:**
+- [ ] `correlate_news_to_price(sector="Banks", lookback_days=180)` returns sector-aggregate output
+- [ ] At least one sector (Banks) shows statistically significant signal (p < 0.05) at some lag
+- [ ] Output explicitly states it's sector-aggregate, lists the constituent tickers
+- [ ] Web UI surfaces sector mode toggle
+
+**Effort:** ~3 hours (server logic 1.5hr, web UI 1hr, testing 0.5hr)
+**Depends on:** Nothing — sector peer sets already curated in server.py for valuation
+
+**Stretch:** add cross-sector contagion analysis — does Banks news lead Real Estate returns (credit channel)? Does Materials sentiment lead Industrial returns? These cross-sector relationships are where VN macro intuition lives.
+
+---
+
 # Tier 3 — After Phase 2 (requires embeddings)
 
 These need the search infrastructure from PLAN.md Phase 2-3.
@@ -457,22 +575,23 @@ Take a note on phone → Obsidian Git syncs to repo → next ingest run pulls it
 Pick whatever matches your immediate use case, but my default ordering:
 
 ```
-K1 (hubs) — 30 min                ──┐
-K2 (coverage report) — 45 min       │  Build foundation while
-K6 (daily brief) — 2 hrs            │  embeddings aren't ready
+K1 (hubs) — 30 min                ──┐  Foundation
+K2 (coverage report) — 45 min       │  No LLM dependency
                                   ──┘
+
+K19 (LLM sentiment, ~$0.40 backfill) ──┐  Make news-correlation
+K20 (theme tagging) — 4 hrs              │  meaningfully accurate
+K21 (sector aggregate) — 3 hrs       ──┘  Higher statistical power
 
 [ wait for Phase 2 to ship — embeddings ]
 
 K11 (knowledge_search MCP) — 2 hrs ──┐  Unlock cross-source
-K9 (thesis context) — 1 hr             │  intelligence
-K8 (cross-reference engine) — 3 hrs ──┘
+K14 (concept wiki) — 1-2 hrs/page   ──┘  intelligence
 
 [ ongoing ]
 
 K7 (Buffett concepts) — author 1 wiki page per week
-K14 (concept wiki) — 1 page per session
-K16 (sentiment tracking) — when corpus is dense enough
+K10 (narrative timeline) — quarterly retrospective
 ```
 
 ---
