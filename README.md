@@ -4,11 +4,16 @@ An MCP (Model Context Protocol) server for **Claude Code** that turns Claude int
 
 ## Features
 
-- **8 MCP tools** covering fundamentals, technicals, news, PDF reports, and peer comparison
-- **5 specialized agent skills** with expert personas, trigger routing, and anti-patterns
+- **25 MCP tools** spanning data, news, analysis, valuation, risk management, journaling, and performance review
+- **6 specialized agent skills** with expert personas, trigger routing, and anti-patterns
+- **End-to-end investing discipline** — covers all 4 phases of a structured investing curriculum (foundation → analytical → execution & risk → mastery)
+- **Web UI for non-technical users** — Next.js dashboard for screening, sizing, and performance review (see [web/README.md](web/README.md))
 - **Multimodal PDF reading** — loads scanned Vietnamese financial reports visually
-- **Rate-limit resilient** — subprocess isolation prevents vnstock `sys.exit()` crashes
+- **Rate-limit resilient** — subprocess isolation + file-based response cache (24h for statements, 5min for prices)
 - Covers all Vietnamese exchanges: **HOSE, HNX, UPCOM**
+
+📖 **[Read the User Guide](GUIDE.md)** for workflows, position lifecycle, and prompt examples.
+🌐 **[Web UI docs](web/README.md)** to run the Next.js frontend.
 
 ## Quick Start
 
@@ -34,19 +39,23 @@ analyze FPT and compare with CMG and VGI
 | `vn-portfolio-manager` | "compare FPT vs VNM vs MWG", "best tech stock?" |
 | `vn-news-analyst` | "any news on FPT?", "when is the dividend?", "insider activity" |
 | `vn-report-reader` | `analyze /path/to/annual_report.pdf` |
+| `vn-risk-manager` | "size this position", "write a thesis", "review my performance" |
 
-## MCP Tools
+## MCP Tools (25)
 
-| Tool | Description |
-|---|---|
-| `get_analysis_prompt` | 10-section expert research framework |
-| `get_technical_analysis` | MA, RSI, MACD, Bollinger Bands, ATR, support/resistance |
-| `fetch_broker_news` | Analyst consensus, events, insider trades, news |
-| `compare_stocks` | Side-by-side peer comparison table |
-| `get_financial_data` | Income statement, balance sheet, cash flow |
-| `get_stock_overview` | Price, 52W range, market cap, analyst rating |
-| `load_financial_pdf` | Multimodal reading of scanned PDF reports |
-| `save_analysis` | Persist analysis as Markdown with auto-index |
+Grouped by what they do:
+
+**Data & overview** — `get_stock_overview`, `get_financial_data`, `get_market_overview`, `get_macro_data`, `get_commodity_prices`, `get_vn_macro_indicators`, `get_foreign_flow`
+
+**News & catalysts** — `fetch_broker_news`, `get_market_news`, `get_economy_news`
+
+**Analysis & valuation** — `get_analysis_prompt`, `get_technical_analysis`, `compare_stocks`, `get_dcf_valuation`, `get_earnings_quality`, `get_quality_score`, `load_financial_pdf`
+
+**Risk & portfolio** — `get_position_sizing`, `stress_test_portfolio`, `manage_watchlist`, `check_watchlist`
+
+**Journaling & review** — `save_analysis`, `save_investment_thesis`, `save_decision_log`, `review_performance`
+
+For full descriptions of each tool, see [CLAUDE.md](CLAUDE.md). For workflow examples and prompt patterns, see [GUIDE.md](GUIDE.md).
 
 ## Data Sources
 
