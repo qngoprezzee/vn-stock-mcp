@@ -288,6 +288,17 @@ async def knowledge_daily_brief_read(date: str) -> dict[str, Any]:
     return {"status": "missing", "path": "", "content": ""}
 
 
+class NewsCorrelationRequest(BaseModel):
+    ticker: str
+    lookback_days: int = 90
+
+
+@app.post("/api/stock/news-correlation")
+async def news_correlation(req: NewsCorrelationRequest) -> dict[str, str]:
+    result = await server._correlate_news_to_price(req.model_dump())
+    return {"text": _text(result)}
+
+
 @app.get("/api/knowledge/glossary")
 async def knowledge_glossary() -> dict[str, Any]:
     """Return the curated concept glossary for valuation terms (DCF, WACC, P/E, etc.)."""

@@ -100,6 +100,9 @@ export const stockForeignFlow = (ticker: string) =>
 export const stockTechnical = (ticker: string) =>
   postJSON<TextResponse>("/api/stock/technical", { ticker });
 
+export const stockNewsCorrelation = (params: { ticker: string; lookback_days?: number }) =>
+  postJSON<TextResponse>("/api/stock/news-correlation", params);
+
 export const stockDCF = (params: {
   ticker: string;
   discount_rate?: number;

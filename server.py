@@ -684,6 +684,26 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
+            name="correlate_news_to_price",
+            description=(
+                "Quantify how a ticker's news flow relates to its price action. "
+                "Pulls articles + daily prices over the lookback window, scores each article's "
+                "sentiment (keyword-based, VN + EN), then computes cross-correlation at lags "
+                "−2/−1/0/+1/+2 days between news volume + net sentiment and returns. "
+                "Tells you whether news LEADS price (information edge), REACTS to price (noise), "
+                "or is uncorrelated (irrelevant). Surfaces spike days with headlines."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticker": {"type": "string", "description": "VN ticker symbol (uppercase, e.g. FPT)."},
+                    "lookback_days": {"type": "integer", "default": 90,
+                                      "description": "Trading days to analyze (default 90; min 30 for statistical signal)."},
+                },
+                "required": ["ticker"],
+            },
+        ),
+        types.Tool(
             name="thesis_context",
             description=(
                 "Bundle pre-thesis context for a VN ticker: recent news mentioning it, your existing "
@@ -857,6 +877,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent | type
         return await _thesis_context(arguments)
     elif name == "compare_authors_on":
         return await _compare_authors_on(arguments)
+    elif name == "correlate_news_to_price":
+        return await _correlate_news_to_price(arguments)
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -4242,6 +4264,229 @@ async def _compare_authors_on(args: dict) -> list[types.TextContent]:
         lines.append("**Next:** synthesize where these authors agree, where they disagree, and what it means for your VN equity research.")
 
     return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+async def _correlate_news_to_price(args: dict) -> list[types.TextContent]:
+    """K-NPC: news ↔ price correlation analysis with sentiment + lag cross-correlation."""
+    ticker: str = args["ticker"].upper()
+    lookback_days: int = int(args.get("lookback_days", 90))
+
+    try:
+        import pandas as pd
+        from datetime import date, timedelta
+        from scipy.stats import pearsonr
+
+        from knowledge.lib.corpus import iter_sources, _parse_loose_date
+        from knowledge.lib.sentiment import score_sentiment, label_sentiment
+
+        # ── 1. Pull articles for this ticker over the window ─────────────────
+        articles = list(iter_sources(
+            category="articles",
+            tickers=[ticker],
+            since_days=lookback_days,
+        ))
+
+        if len(articles) < 5:
+            return [types.TextContent(type="text", text=(
+                f"## News-Price Correlation — {ticker} ({lookback_days} days)\n\n"
+                f"**Only {len(articles)} article(s) found mentioning {ticker} in the lookback window.**\n\n"
+                f"Need ≥15 articles for meaningful correlation. Suggestions:\n"
+                f"- Extend lookback_days (try 180)\n"
+                f"- Run `ingest_rss` to refresh the corpus\n"
+                f"- This ticker may not have material coverage in our VN news sources"
+            ))]
+
+        # Score sentiment for each article
+        article_data: list[dict] = []
+        for s in articles:
+            text = (s.title or "") + " " + (s.body[:600] if s.body else "")
+            sent = score_sentiment(text)
+            dt = _parse_loose_date(s.pub_date) or _parse_loose_date(s.ingested_at)
+            if dt is None:
+                continue
+            article_data.append({
+                "date":      dt.date(),
+                "title":     s.title,
+                "url":       s.url,
+                "source":    s.source_name,
+                "sentiment": sent["score"],
+            })
+
+        if not article_data:
+            return [types.TextContent(type="text", text=f"No parseable article dates for {ticker}.")]
+
+        df_news = pd.DataFrame(article_data)
+
+        # ── 2. Daily aggregation: per-trading-day article count + mean sentiment
+        daily_news = df_news.groupby("date").agg(
+            n_articles=("title", "count"),
+            mean_sentiment=("sentiment", "mean"),
+        ).reset_index()
+
+        # ── 3. Pull daily prices over a slightly extended window for lag analysis
+        raw_prices = await _vnstock_subprocess("quote_history_full",
+                                                {"ticker": ticker, "days": lookback_days + 10})
+        price_rows = json.loads(raw_prices)
+        if not price_rows or isinstance(price_rows, dict):
+            return [types.TextContent(type="text", text=f"No price data available for {ticker}.")]
+
+        df_price = pd.DataFrame(price_rows)
+        df_price["close"] = df_price["close"].astype(float) * 1000
+        df_price["date"]  = pd.to_datetime(df_price["time"]).dt.date
+        df_price = df_price.sort_values("date").reset_index(drop=True)
+        df_price["return"]     = df_price["close"].pct_change() * 100
+        df_price["abs_return"] = df_price["return"].abs()
+
+        # ── 4. Merge on trading dates, fill non-news days with 0 articles
+        merged = df_price.merge(daily_news, on="date", how="left")
+        merged["n_articles"]      = merged["n_articles"].fillna(0)
+        merged["mean_sentiment"]  = merged["mean_sentiment"].fillna(0)
+
+        # Drop the very first row (no return) and warm-up gaps
+        merged = merged.dropna(subset=["return"]).reset_index(drop=True)
+
+        if len(merged) < 20:
+            return [types.TextContent(type="text", text=(
+                f"## News-Price Correlation — {ticker}\n\n"
+                f"Insufficient overlap between news ({len(article_data)} articles) and "
+                f"price data ({len(merged)} trading days). Try a longer lookback window."
+            ))]
+
+        # ── 5. Cross-correlation at lags
+        def safe_pearson(x: list, y: list) -> tuple[float, float]:
+            if len(x) < 10:
+                return 0.0, 1.0
+            try:
+                r, p = pearsonr(x, y)
+                return float(r), float(p)
+            except Exception:
+                return 0.0, 1.0
+
+        # Build lag table: shift news by -2..+2 days against returns
+        # Lag = -k means news leads price by k days (i.e. today's news vs k-day-forward return)
+        # Lag = +k means news lags price by k days (i.e. today's news vs k-day-prior return)
+        # We compute by shifting RETURNS instead, which is equivalent and easier to reason about.
+        lag_table: list[dict] = []
+        for lag in (-2, -1, 0, 1, 2):
+            # When lag = -2: news on day t correlated with return on day t+2 (news LEADS by 2 days)
+            shifted_return = merged["return"].shift(-lag)  # type: ignore
+            valid_mask = ~shifted_return.isna()
+
+            x_news  = merged.loc[valid_mask, "n_articles"].tolist()
+            y_ret   = shifted_return[valid_mask].tolist()
+            r_vol, p_vol = safe_pearson(x_news, y_ret)
+
+            x_sent  = merged.loc[valid_mask, "mean_sentiment"].tolist()
+            r_sent, p_sent = safe_pearson(x_sent, y_ret)
+
+            lag_table.append({
+                "lag":       lag,
+                "r_volume":  r_vol,
+                "p_volume":  p_vol,
+                "r_sent":    r_sent,
+                "p_sent":    p_sent,
+                "n":         len(x_news),
+            })
+
+        # Determine lead/lag verdict
+        r_lead  = next(r["r_volume"] for r in lag_table if r["lag"] == -1)
+        r_react = next(r["r_volume"] for r in lag_table if r["lag"] == +1)
+        r_same  = next(r["r_volume"] for r in lag_table if r["lag"] == 0)
+
+        if abs(r_lead) > abs(r_react) and abs(r_lead) > 0.15:
+            verdict = "🟢 NEWS LEADS PRICE — possible information edge. Reading these headlines early may help."
+        elif abs(r_react) > abs(r_lead) and abs(r_react) > 0.15:
+            verdict = "🔴 NEWS REACTS TO PRICE — headlines describe yesterday's moves. Don't over-trade on them."
+        elif abs(r_same) > 0.25:
+            verdict = "🟡 NEWS AND PRICE MOVE TOGETHER — contemporaneous, ambiguous causation."
+        else:
+            verdict = "⚪ NO CLEAR RELATIONSHIP — news for this ticker is uncorrelated with returns. Treat as noise."
+
+        # ── 6. Spike days: highest news volume
+        spike_days = merged.nlargest(5, "n_articles").copy()
+        spike_days = spike_days[spike_days["n_articles"] > 0]
+
+        # Date-keyed lookup of titles for spike days
+        title_by_date: dict = {}
+        for d, group in df_news.groupby("date"):
+            title_by_date[d] = group.iloc[0]["title"]  # show first title; could show all
+
+        # ── 7. Recent sentiment summary
+        recent_30 = df_news[df_news["date"] >= (date.today() - timedelta(days=30))]
+        net_sentiment_30 = float(recent_30["sentiment"].mean()) if not recent_30.empty else 0.0
+        net_sentiment_all = float(df_news["sentiment"].mean()) if not df_news.empty else 0.0
+
+        # ── 8. Format markdown ──────────────────────────────────────────────
+        lines = [
+            f"## News-Price Correlation — {ticker} ({lookback_days} days)",
+            "",
+            "### Coverage",
+            f"- **{len(article_data)} articles** mentioning {ticker} in the lookback window",
+            f"- Days with ≥1 article: {(merged['n_articles'] > 0).sum()} / {len(merged)} trading days "
+            f"({(merged['n_articles'] > 0).mean() * 100:.0f}%)",
+            f"- Max articles on a single day: {int(merged['n_articles'].max())}",
+            "",
+            "### Cross-correlation: news volume → returns",
+            "*Lag −k = news *leads* price by k days (information edge). "
+            "Lag +k = news *reacts* to price (noise).*",
+            "",
+            "| Lag | Pearson r | p-value | n | Reading |",
+            "|---:|---:|---:|---:|---|",
+        ]
+        for row in lag_table:
+            sig = "***" if row["p_volume"] < 0.01 else ("**" if row["p_volume"] < 0.05 else ("*" if row["p_volume"] < 0.10 else ""))
+            label_map = {-2: "news leads 2d", -1: "news leads 1d", 0: "contemporaneous",
+                         1: "news lags 1d (reacts)", 2: "news lags 2d (reacts)"}
+            lines.append(f"| {row['lag']:+d} | {row['r_volume']:+.3f}{sig} | {row['p_volume']:.3f} | {row['n']} | {label_map[row['lag']]} |")
+
+        lines += [
+            "",
+            f"**Verdict: {verdict}**",
+            "",
+            "*Significance: \\*\\*\\* p<0.01, \\*\\* p<0.05, \\* p<0.10*",
+            "",
+            "### Cross-correlation: net sentiment → returns",
+            "| Lag | Pearson r | p-value | Reading |",
+            "|---:|---:|---:|---|",
+        ]
+        for row in lag_table:
+            sig = "***" if row["p_sent"] < 0.01 else ("**" if row["p_sent"] < 0.05 else ("*" if row["p_sent"] < 0.10 else ""))
+            direction = "bullish-tone-with-positive-return" if row["r_sent"] > 0 else "bullish-tone-with-negative-return (contrarian)"
+            lines.append(f"| {row['lag']:+d} | {row['r_sent']:+.3f}{sig} | {row['p_sent']:.3f} | {direction if abs(row['r_sent']) > 0.10 else 'weak'} |")
+
+        lines += [
+            "",
+            "### Sentiment summary",
+            f"- **30-day net sentiment**: {net_sentiment_30:+.3f} ({label_sentiment(net_sentiment_30)})",
+            f"- **{lookback_days}-day net sentiment**: {net_sentiment_all:+.3f} ({label_sentiment(net_sentiment_all)})",
+            f"- Delta: {(net_sentiment_30 - net_sentiment_all):+.3f} "
+            f"({'improving' if net_sentiment_30 > net_sentiment_all else 'deteriorating' if net_sentiment_30 < net_sentiment_all else 'stable'} vs window average)",
+            "",
+            "### Top news-volume days",
+            "| Date | Articles | Return | Net Sent | Top headline |",
+            "|---|---:|---:|---:|---|",
+        ]
+        for _, row in spike_days.iterrows():
+            ret_str = f"{row['return']:+.2f}%" if pd.notna(row["return"]) else "—"
+            sent_str = f"{row['mean_sentiment']:+.2f}"
+            title = title_by_date.get(row["date"], "")[:80].replace("|", "\\|")
+            lines.append(f"| {row['date']} | {int(row['n_articles'])} | {ret_str} | {sent_str} | {title} |")
+
+        lines += [
+            "",
+            "### Caveats",
+            "- Keyword sentiment is crude (~70% accuracy). Misses sarcasm + context.",
+            "- 90 trading days ≈ 90 observations. Correlations of ±0.20 are borderline significant.",
+            "- Causation ≠ correlation. \"News leads price\" could be edge OR shared response to a third variable (market regime, sector flow).",
+            "- For tickers with <15 articles, results are noise.",
+        ]
+
+        text = "\n".join(lines)
+
+    except Exception as e:
+        text = f"News-price correlation failed for {ticker}: {type(e).__name__}: {e}"
+
+    return [types.TextContent(type="text", text=text)]
 
 
 async def main():
