@@ -73,6 +73,14 @@ try:
             .cash_flow(period=kwargs.get("period", "year"), lang="en")
         )
 
+    elif func_name == "price_board":
+        try:
+            from vnstock import Trading
+            tickers = kwargs.get("tickers", [kwargs.get("ticker")])
+            result = _df_to_json(Trading(source="VCI").price_board(symbol_ls=tickers))
+        except Exception as e:
+            result = {"error": f"price_board unavailable: {e}"}
+
     else:
         result = {"error": f"Unknown function: {func_name}"}
 

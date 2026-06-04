@@ -29,28 +29,68 @@ Before responding to any request, identify which skill applies and follow its SK
 | Compare stocks, portfolio allocation, sector ranking | **vn-portfolio-manager** | `.agents/skills/vn-portfolio-manager/SKILL.md` |
 | News, events, dividends, insider trades, catalysts | **vn-news-analyst** | `.agents/skills/vn-news-analyst/SKILL.md` |
 | Load a PDF report (annual, quarterly, broker report) | **vn-report-reader** | `.agents/skills/vn-report-reader/SKILL.md` |
+| Position sizing, stop-loss, thesis writing, decision log | **vn-risk-manager** | `.agents/skills/vn-risk-manager/SKILL.md` |
 | Simple price check, quick overview | Direct: `get_stock_overview` | No skill needed |
+| Market pulse, "how is market today", index performance | Direct: `get_market_overview` | No skill needed |
+| Economy news, "what's happening today", macro headlines | Direct: `get_economy_news` | No skill needed |
 
 **AI Instruction**: Read the SKILL.md for the matched skill before proceeding.
 Each skill defines: trigger conditions, anti-patterns, multi-step workflow, and a quality checklist.
 
 ---
 
-## 🛠️ MCP Tools (11 total)
+## 🛠️ MCP Tools (27 total)
 
+### Data & overview
+| Tool | Skill(s) | Description |
+|---|---|---|
+| `get_stock_overview` | all skills | Price, 52W range, market cap, analyst rating, target price |
+| `get_financial_data` | equity-analyst, report-reader | Income statement, balance sheet, cash flow — annual or quarterly |
+| `get_market_overview` | all skills | VN-Index, HNX-Index, UPCOM performance today + top gainers/losers from large-caps |
+| `get_macro_data` | equity-analyst | Live exchange rates (USD/VND, EUR, JPY, CNY…) from Vietcombank XML |
+| `get_commodity_prices` | equity-analyst | Live gold (SJC, BTMC) and silver prices in VND/lượng from BTMC |
+| `get_vn_macro_indicators` | equity-analyst | World Bank annual data: GDP growth, CPI, real rates, unemployment, current account |
+| `get_foreign_flow` | equity-analyst, news-analyst | Foreign ownership %, foreign room, today's net buy/sell snapshot from price_board |
+
+### News & catalysts
+| Tool | Skill(s) | Description |
+|---|---|---|
+| `fetch_broker_news` | news-analyst, report-reader | Analyst consensus, events, insider trades, news (via vnstock/FiinGroup); optionally load broker PDF |
+| `get_market_news` | news-analyst | RSS crawler: CafeF, VietStock, VnExpress Business, VIR — editorial coverage filtered by ticker |
+| `get_economy_news` | news-analyst | General economic & market headlines from VnEconomy, Báo Đầu tư, CafeF, VnExpress — no ticker filter |
+
+### Analysis & valuation
 | Tool | Skill(s) | Description |
 |---|---|---|
 | `get_analysis_prompt` | equity-analyst | 10-section expert framework — call FIRST for any full analysis |
 | `get_technical_analysis` | technical-analyst | MA20/50/200, RSI, MACD, BB, ATR, volume, key levels, signal score |
-| `fetch_broker_news` | news-analyst, report-reader | Analyst consensus, events, insider trades, news (via vnstock/FiinGroup); optionally load broker PDF |
-| `get_market_news` | news-analyst | RSS crawler: CafeF, Tin Nhanh CK, VietStock — editorial coverage filtered by ticker |
-| `get_macro_data` | equity-analyst | Live exchange rates (USD/VND, EUR, JPY, CNY…) from Vietcombank XML |
-| `get_commodity_prices` | equity-analyst | Live gold (SJC, BTMC) and silver prices in VND/lượng from BTMC |
-| `compare_stocks` | portfolio-manager | Side-by-side peer table: P/E, EV/EBITDA, PEG, ROE, margins, health |
-| `get_financial_data` | equity-analyst, report-reader | Income statement, balance sheet, cash flow — annual or quarterly |
-| `get_stock_overview` | all skills | Price, 52W range, market cap, analyst rating, target price |
+| `compare_stocks` | portfolio-manager | Side-by-side peer table: P/E, EV/EBITDA, PEG, ROE, ROIC, margins, health |
+| `get_dcf_valuation` | equity-analyst, risk-manager | DCF intrinsic value: bull/base/bear scenarios, margin of safety vs current price |
+| `get_earnings_quality` | equity-analyst | 5-dim quality score: FCF/NI, OCF margin, accruals (Sloan), WC discipline, OCF consistency |
+| `get_quality_score` | equity-analyst, portfolio-manager | Single 0-100 score from ROIC, FCF/NI, debt/equity, revenue CAGR, margin — for screening |
 | `load_financial_pdf` | report-reader | Convert scanned PDF pages to images for visual reading |
+
+### Risk & portfolio
+| Tool | Skill(s) | Description |
+|---|---|---|
+| `get_position_sizing` | risk-manager | ATR-based stop-loss + fixed-fractional sizing: shares, VND value, portfolio weight, R/R table |
+| `stress_test_portfolio` | risk-manager | Apply -10/-20/-30% market shocks with sector betas; flag drawdown rules + concentration |
+| `manage_watchlist` | risk-manager, technical-analyst | Add/remove/list tickers in personal `.watchlist.json` |
+| `check_watchlist` | risk-manager, technical-analyst | Scan watchlist for RSI <30/>70, MA50 breaks, >5% daily moves — run at session start |
+
+### Journaling & review
+| Tool | Skill(s) | Description |
+|---|---|---|
 | `save_analysis` | equity-analyst, report-reader | Persist analysis as Markdown to `analyses/` with index |
+| `save_investment_thesis` | risk-manager | Save structured thesis with falsification + pre-mortem fields to `theses/` — write before every trade |
+| `save_decision_log` | risk-manager | Append buy/sell/add/trim decision to `decisions/LOG.md` — log every action for performance review |
+| `review_performance` | risk-manager | Parse decision log, compute win rate / expectancy / clusters, output opinionated triage verdict |
+
+### Knowledge layer (K6-K9)
+| Tool | Skill(s) | Description |
+|---|---|---|
+| `thesis_context` | equity-analyst | Bundle recent news + saved theses + sector principles for a ticker. Call FIRST when writing/revisiting a thesis |
+| `compare_authors_on` | comparative-research | Cross-reference engine: pull passages from multiple authors on a topic — surfaces where investing legends disagree |
 
 ---
 
@@ -71,7 +111,7 @@ claude mcp add vn-stock-mcp $(pwd)/.venv/bin/python -- $(pwd)/server.py
 
 ```
 vn-stock-mcp/
-├── server.py                          # MCP server — all 8 tool handlers
+├── server.py                          # MCP server — all 17 tool handlers
 ├── _vnstock_worker.py                 # Subprocess worker — isolates sys.exit() crashes
 ├── requirements.txt                   # Python deps (mcp, pymupdf, vnstock, pandas-ta)
 ├── CLAUDE.md                          # This file — agent instructions
@@ -82,10 +122,16 @@ vn-stock-mcp/
 │   ├── vn-technical-analyst/SKILL.md  # Technical indicators & trade plans
 │   ├── vn-portfolio-manager/SKILL.md  # Peer comparison & allocation
 │   ├── vn-news-analyst/SKILL.md       # Events, dividends, insider trades
-│   └── vn-report-reader/SKILL.md      # PDF annual/quarterly/broker reports
-└── analyses/
-    ├── INDEX.md                        # Auto-updated list of all saved analyses
-    └── <TICKER>_<period>_<date>.md    # Saved analysis reports
+│   ├── vn-report-reader/SKILL.md      # PDF annual/quarterly/broker reports
+│   └── vn-risk-manager/SKILL.md       # Position sizing, thesis writing, decision log
+├── analyses/
+│   ├── INDEX.md                        # Auto-updated list of all saved analyses
+│   └── <TICKER>_<period>_<date>.md    # Saved analysis reports
+├── theses/
+│   ├── INDEX.md                        # Auto-updated list of all investment theses
+│   └── <TICKER>_thesis_<date>.md      # Written thesis with falsification criteria
+└── decisions/
+    └── LOG.md                          # Append-only decision journal for performance review
 ```
 
 ---

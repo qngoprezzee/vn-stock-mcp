@@ -36,8 +36,18 @@ description: >
 
 ## ⚠️ CRITICAL RULES
 
-> **RULE 1 — CALL get_analysis_prompt FIRST**
-> Always call `get_analysis_prompt(ticker, mode, pdf_path)` before anything else.
+> **RULE 0 — CALL thesis_context FIRST**
+> Before any other tool, call `thesis_context(ticker)` to bundle pre-existing
+> knowledge: recent news mentioning the ticker (last 30 days), your saved
+> analyses/theses on it, and matching sector principles from the knowledge base
+> (Buffett, Marks, Damodaran). This:
+> - Surfaces a falsification flag if the price has crossed your stop-loss
+> - Prevents you re-doing analysis already saved
+> - Pre-loads relevant author wisdom for the company's sector
+> Read the output before calling other tools — it shapes your analysis focus.
+
+> **RULE 1 — CALL get_analysis_prompt SECOND**
+> After thesis_context, call `get_analysis_prompt(ticker, mode, pdf_path)`.
 > It returns the 10-section research framework and instructs you which tools to
 > run next. Never skip this step.
 

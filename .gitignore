@@ -6,3 +6,21 @@ __pycache__/
 .vscode/
 analyses/*.md
 !analyses/INDEX.md
+theses/*.md
+!theses/INDEX.md
+decisions/LOG.md
+.cache/
+.watchlist.json
+.playwright-mcp/
+
+# Next.js web UI build artifacts (deps live in web/node_modules)
+web/node_modules/
+web/.next/
+web/.env.local
+web/.env*.local
+web/next-env.d.ts
+
+# Knowledge layer — sources committed, derived layers regenerable
+knowledge/processed/
+knowledge/store/
+*.embedding
