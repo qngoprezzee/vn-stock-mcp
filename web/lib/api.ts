@@ -118,6 +118,21 @@ export const compareStocks = (tickers: string[], period: "year" | "quarter" = "y
 
 // ── Market ───────────────────────────────────────────────────────────────────
 
+export type IndexInfo = { value: number; change: number; change_pct: number; volume: number };
+export type Mover     = { ticker: string; value: number; change: number; change_pct: number; volume: number };
+export type DashboardData = {
+  indices: { vnindex: IndexInfo; hnx: IndexInfo; upcom: IndexInfo };
+  gainers: Mover[];
+  losers:  Mover[];
+  universe_size: number;
+  movers_age_s:  number | null;
+};
+export type IndexPrice = { date: string; value: number; volume: number };
+
+export const marketDashboardData = () => getJSON<DashboardData>("/api/market/dashboard-data");
+export const marketIndexChart = (index = "VNINDEX", days = 365) =>
+  getJSON<{ index: string; prices: IndexPrice[] }>(`/api/market/index-chart?index=${index}&days=${days}`);
+
 export const marketOverview = () => getJSON<TextResponse>("/api/market/overview");
 export const economyNews = (limit = 20) =>
   getJSON<TextResponse>(`/api/market/economy-news?limit=${limit}`);
@@ -176,7 +191,106 @@ export const reviewPerformance = (lookback_days = 365) =>
 
 export const decisionsRaw = () => getJSON<DecisionsRawResponse>("/api/journal/decisions-raw");
 
-export const apiHealth = () => getJSON<{ status: string }>("/health");
+export const apiHealth = () => getJSON<{ status: string }>("/health")
+
+// ── Chart data ───────────────────────────────────────────────────────────────
+
+export type PriceBar = {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
+export type OverviewData = {
+  ticker: string;
+  name: string;
+  sector: string;
+  price: number;
+  change_pct: number;
+  market_cap_t: number;
+  high_52w: number;
+  low_52w: number;
+  rating: string;
+  target_price: number;
+  foreign_pct: number;
+};
+
+export type IncomeTrend = {
+  ticker: string;
+  years: string[];
+  revenue: (number | null)[];
+  net_income: (number | null)[];
+  gross_profit: (number | null)[];
+};
+
+export type Indicators = {
+  ma20: boolean;
+  ma50: boolean;
+  ma200: boolean;
+  bb: boolean;
+  rsi: boolean;
+  macd: boolean;
+  volume: boolean;
+};
+
+export type TechnicalData = {
+  ticker: string;
+  n_days: number;
+  verdict: "BULLISH" | "MILD_BULLISH" | "NEUTRAL" | "MILD_BEARISH" | "BEARISH";
+  score: number;
+  max_score: number;
+  price: number;
+  mas: { ma20: number | null; ma50: number | null; ma200: number | null; pct_from_ma20: number | null; pct_from_ma50: number | null; pct_from_ma200: number | null };
+  rsi: number | null;
+  macd: { macd: number | null; signal: number | null; hist: number | null };
+  bb: { upper: number | null; mid: number | null; lower: number | null; pct_b: number | null };
+  atr: number | null;
+  atr_pct: number | null;
+  volume: { last: number; avg20: number; ratio: number };
+  levels: { resistance: number; pivot: number; support: number; w52_high: number; w52_low: number; pct_from_high: number; pct_from_low: number };
+};
+
+export const stockTechnicalData = (ticker: string) =>
+  getJSON<TechnicalData>(`/api/stock/technical-data?ticker=${ticker}`);
+
+export type CheckItem = { title: string; description: string; isPass: boolean };
+export type ScorePoint = { point: number };
+export type ExecutiveSummary = {
+  ticker: string;
+  rewards: CheckItem[];
+  risks: CheckItem[];
+  valuationPoint:       ScorePoint;
+  growthPoint:          ScorePoint;
+  passPerformancePoint: ScorePoint;
+  financialHealthPoint: ScorePoint;
+  dividendPoint:        ScorePoint;
+  companyQuality: number;
+  overallRiskLevel: string;
+  qualityValuation: string;
+  downsideRisk: number;
+  sharpeRatio: number;
+  downsideRiskLevel: string;
+  liquidityRiskLevel: string;
+  liquidityMsg: string;
+  taSignal1d: string;
+};
+
+export const stockExecutiveSummary = (ticker: string) =>
+  getJSON<ExecutiveSummary>(`/api/stock/executive-summary?ticker=${ticker}`);
+
+export const stockChartData = (ticker: string, days = 90) =>
+  getJSON<{ ticker: string; prices: PriceBar[] }>(
+    `/api/stock/chart-data?ticker=${ticker}&days=${days}`,
+  );
+
+export const stockOverviewData = (ticker: string) =>
+  getJSON<OverviewData>(`/api/stock/overview-data?ticker=${ticker}`);
+
+export const stockIncomeTrend = (ticker: string) =>
+  getJSON<IncomeTrend>(`/api/stock/income-trend?ticker=${ticker}`);;
 
 // ── Knowledge layer (K6-K9) ────────────────────────────────────────────────
 

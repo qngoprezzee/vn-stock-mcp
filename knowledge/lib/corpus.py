@@ -54,6 +54,10 @@ class Source:
     def pub_date(self) -> str:     return self.metadata.get("pub_date", "")
     @property
     def ingested_at(self) -> str:  return self.metadata.get("ingested_at", "")
+    @property
+    def sentiment_llm(self) -> dict | None:
+        v = self.metadata.get("sentiment_llm")
+        return v if isinstance(v, dict) else None
 
 
 def load_manifest() -> dict:
@@ -79,7 +83,12 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
         value = value.strip()
         if not key:
             continue
-        if value.startswith("[") and value.endswith("]"):
+        if value.startswith("{") and value.endswith("}"):
+            try:
+                fields[key] = json.loads(value)
+            except json.JSONDecodeError:
+                fields[key] = value
+        elif value.startswith("[") and value.endswith("]"):
             inner = value[1:-1].strip()
             items: list[str] = []
             for tok in re.findall(r'"([^"]*)"', inner):

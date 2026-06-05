@@ -180,3 +180,21 @@ def label_sentiment(score: float) -> str:
     if score <= -0.3:   return "strong-negative"
     if score <= -0.05:  return "negative"
     return "neutral"
+
+
+def score_article(source, text: str) -> dict:
+    """Prefer cached LLM score from frontmatter; fall back to keyword scoring.
+
+    ``source`` is a ``knowledge.lib.corpus.Source`` instance (typed as Any to
+    avoid a circular import — only ``sentiment_llm`` property is accessed).
+    """
+    llm = getattr(source, "sentiment_llm", None)
+    if llm and isinstance(llm.get("score"), (int, float)):
+        return {
+            "score":  float(llm["score"]),
+            "source": "llm",
+            "reason": llm.get("reason"),
+        }
+    result = score_sentiment(text)
+    result["source"] = "keyword"
+    return result

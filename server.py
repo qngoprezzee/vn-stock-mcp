@@ -4277,7 +4277,7 @@ async def _correlate_news_to_price(args: dict) -> list[types.TextContent]:
         from scipy.stats import pearsonr
 
         from knowledge.lib.corpus import iter_sources, _parse_loose_date
-        from knowledge.lib.sentiment import score_sentiment, label_sentiment
+        from knowledge.lib.sentiment import score_article, label_sentiment
 
         # ── 1. Pull articles for this ticker over the window ─────────────────
         articles = list(iter_sources(
@@ -4296,11 +4296,14 @@ async def _correlate_news_to_price(args: dict) -> list[types.TextContent]:
                 f"- This ticker may not have material coverage in our VN news sources"
             ))]
 
-        # Score sentiment for each article
+        # Score sentiment — prefer cached LLM score in frontmatter, else keyword
         article_data: list[dict] = []
+        llm_scored = 0
         for s in articles:
             text = (s.title or "") + " " + (s.body[:600] if s.body else "")
-            sent = score_sentiment(text)
+            sent = score_article(s, text)
+            if sent.get("source") == "llm":
+                llm_scored += 1
             dt = _parse_loose_date(s.pub_date) or _parse_loose_date(s.ingested_at)
             if dt is None:
                 continue
@@ -4422,6 +4425,9 @@ async def _correlate_news_to_price(args: dict) -> list[types.TextContent]:
             "",
             "### Coverage",
             f"- **{len(article_data)} articles** mentioning {ticker} in the lookback window",
+            f"- Sentiment source: **{llm_scored} LLM-scored** / {len(articles) - llm_scored} keyword "
+            f"({llm_scored / len(articles) * 100:.0f}% LLM coverage) "
+            f"{'✅' if llm_scored / len(articles) >= 0.8 else '⚠️ run score_sentiment_llm for better accuracy'}",
             f"- Days with ≥1 article: {(merged['n_articles'] > 0).sum()} / {len(merged)} trading days "
             f"({(merged['n_articles'] > 0).mean() * 100:.0f}%)",
             f"- Max articles on a single day: {int(merged['n_articles'].max())}",
@@ -4472,10 +4478,17 @@ async def _correlate_news_to_price(args: dict) -> list[types.TextContent]:
             title = title_by_date.get(row["date"], "")[:80].replace("|", "\\|")
             lines.append(f"| {row['date']} | {int(row['n_articles'])} | {ret_str} | {sent_str} | {title} |")
 
+        sentiment_caveat = (
+            "- LLM sentiment (~95% accuracy on context + sarcasm)."
+            if llm_scored / len(articles) >= 0.8
+            else f"- Sentiment is {llm_scored / len(articles) * 100:.0f}% LLM + "
+                 f"{(len(articles) - llm_scored) / len(articles) * 100:.0f}% keyword (~70% accuracy). "
+                 "Run `python -m knowledge.pipelines.score_sentiment_llm` to backfill."
+        )
         lines += [
             "",
             "### Caveats",
-            "- Keyword sentiment is crude (~70% accuracy). Misses sarcasm + context.",
+            sentiment_caveat,
             "- 90 trading days ≈ 90 observations. Correlations of ±0.20 are borderline significant.",
             "- Causation ≠ correlation. \"News leads price\" could be edge OR shared response to a third variable (market regime, sector flow).",
             "- For tickers with <15 articles, results are noise.",

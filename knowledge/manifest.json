@@ -2,10 +2,10 @@
   "version": 1,
   "last_run": "2026-06-04T15:24:25+07:00",
   "stats": {
-    "total_sources": 478,
+    "total_sources": 479,
     "by_type": {
       "article": 468,
-      "pdf": 6,
+      "pdf": 7,
       "blog": 3,
       "regulatory": 1
     }
@@ -5746,6 +5746,18 @@
       "category": "papers",
       "path": "knowledge/sources/papers/2026-06-04_aswath-damodaran-nyu-stern_1ff8737c.md",
       "ingested_at": "2026-06-04T19:50:20+07:00"
+    },
+    "vietnam-daily-report_2026-06-05_bc334f3a": {
+      "source": "Vietnam daily report",
+      "source_url": "",
+      "url": "file:///private/var/folders/ss/sv6wy1w542125y0pkwjr13rm0000gn/T/tmp53z84qfi.pdf",
+      "title": "Vietnam daily report",
+      "pub_date": "D:20260603173538+07'00'",
+      "content_hash": "0ce6d6687be6586e",
+      "type": "pdf",
+      "category": "filings",
+      "path": "knowledge/sources/filings/2026-06-05_vietnam-daily-report_bc334f3a.md",
+      "ingested_at": "2026-06-05T17:29:46+07:00"
     }
   }
 }

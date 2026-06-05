@@ -2,12 +2,15 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, TrendingUp, Calculator, Activity, FileText, Sun, Scale, Target, Newspaper } from "lucide-react";
+import { LayoutDashboard, TrendingUp, Calculator, Activity, FileText, Sun, Scale, Target, Newspaper, BarChart2, Gauge, FolderOpen } from "lucide-react";
 
 const nav = [
-  { href: "/",              label: "Dashboard",      icon: LayoutDashboard },
-  { href: "/brief",         label: "Brief",          icon: Sun },
-  { href: "/screener",      label: "Screen",         icon: TrendingUp },
+  { href: "/",              label: "Dashboard",  icon: LayoutDashboard },
+  { href: "/brief",         label: "Brief",      icon: Sun },
+  { href: "/stock",         label: "Charts",     icon: BarChart2 },
+  { href: "/technical",     label: "Technical",  icon: Gauge },
+  { href: "/screener",      label: "Screen",     icon: TrendingUp },
+  { href: "/reports",       label: "Reports",    icon: FolderOpen },
   { href: "/valuation",     label: "Valuation",      icon: Target },
   { href: "/news-impact",   label: "News Impact",    icon: Newspaper },
   { href: "/position-sizer",label: "Sizer",          icon: Calculator },
@@ -24,7 +27,7 @@ export function NavBar() {
         <Link href="/" className="font-semibold text-slate-900 dark:text-slate-100 mr-6">
           🇻🇳 VN Stock
         </Link>
-        <div className="flex gap-1 flex-1">
+        <div className="flex gap-1 flex-1 flex-wrap">
           {nav.map(({ href, label, icon: Icon }) => {
             const active = path === href;
             return (
@@ -37,7 +40,7 @@ export function NavBar() {
                     : "text-slate-600 hover:text-slate-900 hover:bg-slate-100 dark:text-slate-400 dark:hover:text-slate-100 dark:hover:bg-slate-800"
                 }`}
               >
-                <Icon size={16} />
+                <Icon size={16} aria-hidden="true" />
                 {label}
               </Link>
             );
