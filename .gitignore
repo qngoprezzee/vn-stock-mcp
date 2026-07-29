@@ -4,6 +4,10 @@ __pycache__/
 *.pyo
 .DS_Store
 .vscode/
+.claude/settings.local.json
+
+# Dev screenshots at repo root — keep in docs/, knowledge/, web/ subfolders if needed
+/*.png
 analyses/*.md
 !analyses/INDEX.md
 theses/*.md
@@ -24,3 +28,9 @@ web/next-env.d.ts
 knowledge/processed/
 knowledge/store/
 *.embedding
+.portfolio.json
+.portfolio_snapshots.json
+.m2_series.json
+.cpi_series.json
+.rate_series.json
+.fx_history.json
