@@ -138,7 +138,7 @@ def already_ingested(manifest: dict, chash: str) -> bool:
 
 def category_dir(category: str) -> Path:
     """Routes a category name to the right sources/ subfolder."""
-    valid = {"articles", "books", "blogs", "filings", "transcripts", "papers", "regulatory"}
+    valid = {"articles", "books", "blogs", "filings", "transcripts", "papers", "regulatory", "macro"}
     if category not in valid:
         category = "articles"  # safe default
     return SOURCES_DIR / category

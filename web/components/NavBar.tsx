@@ -2,17 +2,22 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, TrendingUp, Calculator, Activity, FileText, Sun, Scale, Target, Newspaper, BarChart2, Gauge, FolderOpen } from "lucide-react";
+import { LayoutDashboard, TrendingUp, Calculator, Activity, FileText, Sun, Scale, Target, Newspaper, BarChart2, Gauge, FolderOpen, Rss, Waves, Briefcase, Globe, ArrowDown } from "lucide-react";
 
 const nav = [
   { href: "/",              label: "Dashboard",  icon: LayoutDashboard },
   { href: "/brief",         label: "Brief",      icon: Sun },
   { href: "/stock",         label: "Charts",     icon: BarChart2 },
   { href: "/technical",     label: "Technical",  icon: Gauge },
+  { href: "/money-flow",    label: "Money Flow", icon: Waves },
+  { href: "/macro",         label: "Macro",      icon: Globe },
+  { href: "/topdown",       label: "Top-Down",   icon: ArrowDown },
   { href: "/screener",      label: "Screen",     icon: TrendingUp },
   { href: "/reports",       label: "Reports",    icon: FolderOpen },
+  { href: "/news",          label: "Headlines",  icon: Rss },
   { href: "/valuation",     label: "Valuation",      icon: Target },
   { href: "/news-impact",   label: "News Impact",    icon: Newspaper },
+  { href: "/portfolio",     label: "Portfolio",      icon: Briefcase },
   { href: "/position-sizer",label: "Sizer",          icon: Calculator },
   { href: "/thesis",        label: "Thesis",         icon: FileText },
   { href: "/compare",       label: "Compare",        icon: Scale },

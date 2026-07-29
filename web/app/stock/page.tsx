@@ -4,13 +4,14 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
-  Tooltip, ResponsiveContainer, Legend,
+  Tooltip, ResponsiveContainer, Legend, Cell, ReferenceLine,
 } from "recharts";
 import { Search, RefreshCw, TrendingUp, TrendingDown, Minus } from "lucide-react";
-import { stockChartData, stockOverviewData, stockIncomeTrend, stockExecutiveSummary } from "@/lib/api";
+import { stockChartData, stockOverviewData, stockIncomeTrend, stockExecutiveSummary, stockForeignFlowChart, stockForeignNetAnnual } from "@/lib/api";
 import { TradingChart } from "@/components/TradingChart";
 import { ExecutiveSummarySection } from "@/components/ExecutiveSummary";
-import type { OverviewData, IncomeTrend, Indicators } from "@/lib/api";
+import { AnnualFlowChart } from "@/components/AnnualFlowChart";
+import type { OverviewData, IncomeTrend, Indicators, ForeignFlowPoint, ForeignFlowStatement } from "@/lib/api";
 
 const VND = (n: number) => n.toLocaleString("vi-VN") + " ₫";
 const B   = (n: number | null) => n == null ? "—" : n.toLocaleString("vi-VN", { maximumFractionDigits: 1 }) + " B";
@@ -46,6 +47,18 @@ export default function StockPage() {
   const execSummary = useQuery({
     queryKey: ["executive-summary", ticker],
     queryFn: () => stockExecutiveSummary(ticker),
+    enabled: !!ticker,
+  });
+
+  const foreignFlow = useQuery({
+    queryKey: ["foreign-flow-chart", ticker],
+    queryFn: () => stockForeignFlowChart(ticker),
+    enabled: !!ticker,
+  });
+
+  const annualFlow = useQuery({
+    queryKey: ["foreign-net-annual", ticker],
+    queryFn: () => stockForeignNetAnnual(ticker),
     enabled: !!ticker,
   });
 
@@ -145,6 +158,28 @@ export default function StockPage() {
         <IncomeChart data={income.data} />
       )}
 
+      {annualFlow.data && annualFlow.data.points.length > 0 && (
+        <AnnualFlowChart ticker={annualFlow.data.ticker} points={annualFlow.data.points} />
+      )}
+      {annualFlow.isLoading && (
+        <div className="flex items-center gap-2 text-slate-500 text-sm">
+          <RefreshCw size={14} className="animate-spin" /> Loading annual foreign flow…
+        </div>
+      )}
+
+      {foreignFlow.data && foreignFlow.data.points.length > 0 && (
+        <ForeignFlowChart
+          ticker={foreignFlow.data.ticker}
+          points={foreignFlow.data.points}
+          statements={foreignFlow.data.statements ?? []}
+        />
+      )}
+      {foreignFlow.isLoading && (
+        <div className="flex items-center gap-2 text-slate-500 text-sm">
+          <RefreshCw size={14} className="animate-spin" /> Loading foreign flow…
+        </div>
+      )}
+
       {(overview.error || chart.error) && (
         <p className="text-red-600 text-sm">
           {String((overview.error || chart.error) as Error)}
@@ -191,6 +226,95 @@ function MetricsRow({ data }: { data: OverviewData }) {
         ))}
       </div>
     </div>
+  );
+}
+
+const PERIODS = [
+  { label: "1M",  days: 21 },
+  { label: "3M",  days: 63 },
+  { label: "6M",  days: 126 },
+  { label: "All", days: Infinity },
+];
+
+function ForeignFlowChart({ ticker, points, statements }: {
+  ticker: string;
+  points: ForeignFlowPoint[];
+  statements: ForeignFlowStatement[];
+}) {
+  const [period, setPeriod] = useState(PERIODS[3]);
+  const fmt = (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}B`;
+
+  const visible = period.days === Infinity
+    ? points
+    : points.slice(-period.days);
+
+  return (
+    <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-4">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <h3 className="font-semibold">{ticker} — Net Foreign Flow (B VND)</h3>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Green = net buy &nbsp;·&nbsp; Red = net sell &nbsp;·&nbsp;
+            <span className="text-slate-400">
+              {points.length} session{points.length !== 1 ? "s" : ""} stored
+              {points.length < 60 && " — history grows each visit"}
+            </span>
+          </p>
+        </div>
+        <div className="flex gap-1 shrink-0">
+          {PERIODS.map(p => (
+            <button key={p.label} onClick={() => setPeriod(p)}
+              className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                period.label === p.label
+                  ? "bg-slate-800 dark:bg-slate-600 text-white"
+                  : "text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-700"
+              }`}>
+              {p.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <ResponsiveContainer width="100%" height={220}>
+        <BarChart data={visible} margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+          <XAxis
+            dataKey="date"
+            tick={{ fontSize: 10 }}
+            tickFormatter={(d: string) => d.slice(5)}
+            interval="preserveStartEnd"
+          />
+          <YAxis
+            tickFormatter={(v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(0)}B`}
+            tick={{ fontSize: 11 }}
+            width={52}
+          />
+          <ReferenceLine y={0} stroke="#94a3b8" />
+          <Tooltip
+            formatter={(value) => [fmt(Number(value ?? 0)), "Net value"]}
+            labelFormatter={(label) => `Date: ${String(label)}`}
+          />
+          <Bar dataKey="net_val_b" radius={[2, 2, 0, 0]}>
+            {visible.map((pt, i) => (
+              <Cell key={i} fill={pt.net_val_b >= 0 ? "#10b981" : "#ef4444"} />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+
+      {statements.length > 0 && (
+        <ul className="space-y-1.5">
+          {statements.map((s, i) => (
+            <li key={i} className="flex items-start gap-2 text-xs text-slate-600 dark:text-slate-400">
+              <span className={`mt-0.5 shrink-0 font-bold ${s.isPass ? "text-emerald-500" : "text-red-500"}`}>
+                {s.isPass ? "▲" : "▼"}
+              </span>
+              {s.text}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 

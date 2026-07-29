@@ -17,94 +17,67 @@ from mcp import types
 
 app = Server("vn-stock-mcp")
 
-# vnstock's quota library calls sys.exit() on rate limit, killing the whole process.
-# We isolate every vnstock call in a child subprocess so exits are contained.
-# Each subprocess runs a small JSON-in / JSON-out helper script.
+# ── Shared foundations moved to vn_stock package (Phase A refactor) ─────────
+# server.py handlers remain here; they now import from the package. This keeps
+# the MCP entry-point unchanged while making internals testable.
 
-_VNSTOCK_HELPER = Path(__file__).parent / "_vnstock_worker.py"
-
-# Limit concurrent vnstock subprocess spawns to avoid system overload and rate limits.
-_SUBPROCESS_SEM = asyncio.Semaphore(6)
-
-# File-based cache for vnstock responses — cuts latency and rate-limit risk.
-_CACHE_DIR = Path(__file__).parent / ".cache"
-_CACHE_TTL: dict[str, int] = {
-    "company_overview":   3600,
-    "company_news":       1800,
-    "company_events":     3600,
-    "quote_history":       300,
-    "quote_history_full": 3600,
-    "income_statement":  86400,
-    "balance_sheet":     86400,
-    "cash_flow":         86400,
-    "price_board":         60,
-}
-_DEFAULT_TTL = 3600
-
-
-def _cache_key(func_name: str, kwargs: dict) -> str:
-    payload = func_name + "|" + json.dumps(kwargs, sort_keys=True, default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
-
-
-def _cache_get(func_name: str, kwargs: dict) -> str | None:
-    path = _CACHE_DIR / f"{_cache_key(func_name, kwargs)}.json"
-    if not path.exists():
-        return None
-    try:
-        entry = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    ttl = _CACHE_TTL.get(func_name, _DEFAULT_TTL)
-    if time.time() - entry.get("timestamp", 0) > ttl:
-        return None
-    return entry.get("data")
-
-
-def _cache_set(func_name: str, kwargs: dict, data: str) -> None:
-    # Never cache error payloads
-    if data.lstrip().startswith("{") and '"error"' in data[:100]:
-        return
-    _CACHE_DIR.mkdir(exist_ok=True)
-    path = _CACHE_DIR / f"{_cache_key(func_name, kwargs)}.json"
-    try:
-        path.write_text(
-            json.dumps({"timestamp": time.time(), "data": data}),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-
-
-async def _vnstock_subprocess(func_name: str, kwargs: dict, retries: int = 3) -> str:
-    """Run a named vnstock function in an isolated subprocess. Returns JSON string. Cached."""
-    cached = _cache_get(func_name, kwargs)
-    if cached is not None:
-        return cached
-
-    async with _SUBPROCESS_SEM:
-        for attempt in range(retries):
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, str(_VNSTOCK_HELPER), func_name, json.dumps(kwargs),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                lines = stdout.decode(errors="ignore").splitlines()
-                for line in reversed(lines):
-                    line = line.strip()
-                    if line.startswith("[") or line.startswith("{"):
-                        _cache_set(func_name, kwargs, line)
-                        return line
-                return "[]"
-            err = stderr.decode()
-            if "Rate limit" in err or "RateLimit" in err:
-                wait = 65 if attempt == 0 else 30
-                await asyncio.sleep(wait)
-            else:
-                return json.dumps({"error": err[:300]})
-    return json.dumps({"error": "Rate limit persisted after retries"})
+from vn_stock.config import (
+    CACHE_DIR as _CACHE_DIR,
+    CACHE_TTL as _CACHE_TTL,
+    CYCLICAL_SECTORS as _CYCLICAL_SECTORS,
+    DCF_UNRELIABLE_KEYS as _DCF_UNRELIABLE_KEYS,
+    DEFAULT_TTL as _DEFAULT_TTL,
+    DEFAULT_WEIGHTS as _DEFAULT_WEIGHTS,
+    DEFENSIVE_SECTORS as _DEFENSIVE_SECTORS,
+    CPI_SERIES_PATH,
+    FX_HISTORY_PATH,
+    M2_BANKS as _M2_BANKS,
+    M2_SERIES_PATH,
+    MARKET_WATCH as _MARKET_WATCH,
+    PORTFOLIO_PATH,
+    RATE_SERIES_PATH,
+    SECTOR_BETAS as _SECTOR_BETAS,
+    SECTOR_PEER_SET as _SECTOR_PEER_SET,
+    SNAPSHOTS_PATH,
+    VALUATION_WEIGHTS as _VALUATION_WEIGHTS,
+    VN_SECTORS as _VN_SECTORS,
+    WATCHLIST_PATH,
+    WB_CACHE_TTL_SEC as _WB_CACHE_TTL_SEC,
+    WB_INDICATORS as _WB_INDICATORS,
+    WB_STALE_MAX_SEC as _WB_STALE_MAX_SEC,
+)
+from vn_stock.data.cache import (
+    cache_get as _cache_get,
+    cache_key as _cache_key,
+    cache_set as _cache_set,
+)
+from vn_stock.data.vnstock_client import vnstock_subprocess as _vnstock_subprocess
+from vn_stock.data.worldbank import (
+    fetch_wb_indicator as _fetch_wb_indicator,
+    wb_cache_read as _wb_cache_read,
+    wb_cache_write as _wb_cache_write,
+)
+from vn_stock.analytics.returns import (
+    annualize as _annualize,
+    correlation as _correlation,
+    daily_returns_from_snapshots as _daily_returns_from_snapshots,
+    find_snapshot_at_or_before as _find_snapshot_at_or_before,
+    parse_price_series as _parse_price_series,
+    period_return_from_series,
+    period_return_from_snapshots,
+    rolling_drawdown as _rolling_drawdown,
+    slope_normalized as _slope_normalized,
+    twr as _twr,
+    ytd_return as _ytd_return,
+)
+from vn_stock.analytics.technical import (
+    detect_candle_patterns as _detect_candle_patterns,
+    detect_gaps as _detect_gaps,
+    detect_wyckoff_events as _detect_wyckoff_events,
+    pivot_structure as _pivot_structure,
+)
+from vn_stock.analytics.divergence import detect_divergence as _detect_divergence
+from vn_stock.tools.registry import register_tool, get_all_specs, dispatch
 
 
 def pdf_to_images(pdf_bytes: bytes, max_pages: int = 20) -> list[dict]:
@@ -128,761 +101,19 @@ def pdf_to_images(pdf_bytes: bytes, max_pages: int = 20) -> list[dict]:
 
 @app.list_tools()
 async def list_tools() -> list[types.Tool]:
-    return [
-        types.Tool(
-            name="load_financial_pdf",
-            description=(
-                "Load a financial statement PDF from a local file path or URL. "
-                "Returns each page as an image so you can visually read and analyze "
-                "the financial data (income statement, balance sheet, cash flow, etc.). "
-                "Use this for VN company annual reports and quarterly financial statements."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "source": {
-                        "type": "string",
-                        "description": "Absolute local file path (e.g. /Users/you/fpt_2024.pdf) or HTTPS URL to the PDF.",
-                    },
-                    "max_pages": {
-                        "type": "integer",
-                        "description": "Maximum number of pages to return (default 20, max 40).",
-                        "default": 20,
-                    },
-                },
-                "required": ["source"],
-            },
-        ),
-        types.Tool(
-            name="get_stock_overview",
-            description=(
-                "Get a quick overview of a Vietnam-listed stock: current price, "
-                "market cap, P/E, P/B, 52-week range, and exchange (HOSE/HNX/UPCOM). "
-                "Ticker examples: VIC, FPT, HPG, VNM, MWG."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    }
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="get_financial_data",
-            description=(
-                "Fetch structured financial statements for a VN-listed company: "
-                "income statement, balance sheet, and cash flow statement. "
-                "Returns multiple periods so you can spot trends."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    },
-                    "period": {
-                        "type": "string",
-                        "enum": ["year", "quarter"],
-                        "description": "Annual or quarterly data (default: year).",
-                        "default": "year",
-                    },
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="save_analysis",
-            description=(
-                "Save a completed stock analysis as a Markdown file in the project's analyses/ folder. "
-                "Call this AFTER finishing the analysis to persist it as memory for future sessions."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Full analysis in Markdown format.",
-                    },
-                    "period": {
-                        "type": "string",
-                        "description": "Report period label, e.g. 'Q1-2026' or '2025-annual'. Used in filename.",
-                        "default": "",
-                    },
-                },
-                "required": ["ticker", "content"],
-            },
-        ),
-        types.Tool(
-            name="get_analysis_prompt",
-            description=(
-                "Returns a structured analysis framework to guide a deep-dive of a VN stock. "
-                "Call this FIRST when the user asks to 'analyze' a stock, then use the other "
-                "tools to gather data and follow the framework step by step."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["full", "quick", "pdf"],
-                        "description": (
-                            "full = structured data + PDF report (default); "
-                            "quick = structured data only, no PDF; "
-                            "pdf = PDF report only."
-                        ),
-                        "default": "full",
-                    },
-                    "pdf_path": {
-                        "type": "string",
-                        "description": "Optional path or URL to a financial statement PDF for pdf/full modes.",
-                    },
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="get_technical_analysis",
-            description=(
-                "Compute technical analysis for a VN-listed stock using up to 1 year of daily price data. "
-                "Returns trend, moving averages (MA20/50/200), RSI, MACD, Bollinger Bands, ATR, "
-                "volume profile, support/resistance levels, and an overall technical signal."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    },
-                    "days": {
-                        "type": "integer",
-                        "description": "Number of trading days of history to use (default 365).",
-                        "default": 365,
-                    },
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="fetch_broker_news",
-            description=(
-                "Fetch recent news, corporate events, insider trades, and analyst consensus "
-                "for a VN-listed stock. Aggregates from FiinGroup (via vnstock) which covers "
-                "disclosures from SSI, TCBS, Mirae Asset, VCBS and other local brokers. "
-                "Optionally load a broker research report PDF by providing its URL or local path."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of recent news items to return (default 15).",
-                        "default": 15,
-                    },
-                    "broker_pdf_url": {
-                        "type": "string",
-                        "description": "Optional: URL or local path to a broker research report PDF to load alongside the news.",
-                    },
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="compare_stocks",
-            description=(
-                "Fetch and compare key financial metrics side-by-side for multiple VN-listed stocks. "
-                "Use this to rank peers by valuation, profitability, growth, and financial health. "
-                "Returns a structured comparison table ready for expert analysis."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "tickers": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of VN stock tickers to compare (e.g. ['FPT', 'CMG', 'VGI']).",
-                        "minItems": 2,
-                        "maxItems": 8,
-                    },
-                    "period": {
-                        "type": "string",
-                        "enum": ["year", "quarter"],
-                        "default": "year",
-                        "description": "Annual or most-recent-quarter comparison.",
-                    },
-                },
-                "required": ["tickers"],
-            },
-        ),
-        types.Tool(
-            name="get_macro_data",
-            description=(
-                "Fetch live Vietnamese macroeconomic data: USD/VND and major currency exchange rates "
-                "from Vietcombank, plus the SBV base interest rate context. "
-                "Use this when analyzing currency risk, import/export companies, or macro environment."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        ),
-        types.Tool(
-            name="get_commodity_prices",
-            description=(
-                "Fetch live commodity prices relevant to Vietnam: SJC gold (miếng), BTMC gold, "
-                "silver, and key precious metals in VND per lượng. "
-                "Use this for gold-related stocks (PNJ, SJC), inflation analysis, or macro context."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        ),
-        types.Tool(
-            name="get_market_news",
-            description=(
-                "Crawl Vietnamese financial news sites (CafeF, Tin Nhanh Chứng Khoán, VnExpress, "
-                "Vietnam Investment Review, VietStock) via RSS and return recent articles that mention "
-                "the stock ticker. Complements fetch_broker_news (which pulls from vnstock/FiinGroup) "
-                "with broader editorial coverage from independent news outlets. "
-                "Use this to gauge media sentiment, spot breaking news, or find analyst commentary "
-                "not covered by broker disclosures."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of articles to return (default 20).",
-                        "default": 20,
-                    },
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="get_market_overview",
-            description=(
-                "Show how the Vietnamese stock market is performing today. "
-                "Returns VN-Index, HNX-Index, and UPCOM index levels with today's change (points and %), "
-                "plus top gainers and losers from major large-cap stocks. "
-                "Use this for a quick market pulse check before or after a session."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        ),
-        types.Tool(
-            name="get_economy_news",
-            description=(
-                "Fetch today's top economic and financial headlines from high-signal Vietnamese sources: "
-                "VnEconomy (tạp chí Kinh tế Việt Nam), Báo Đầu tư, CafeF, Tin Nhanh Chứng Khoán, "
-                "VnExpress Business, and Vietnam Investment Review. "
-                "Returns a balanced feed of general market-moving news — macro policy, banking, "
-                "corporate events, FDI, interest rates — not filtered by ticker. "
-                "Use this for a broad economic pulse or when the user asks 'what's happening in the economy today'."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max headlines to return (default 20).",
-                        "default": 20,
-                    }
-                },
-                "required": [],
-            },
-        ),
-        types.Tool(
-            name="get_dcf_valuation",
-            description=(
-                "Triangulated intrinsic value for a VN-listed stock combining (1) DCF with "
-                "bull/base/bear scenarios, (2) peer-relative valuation via median P/E + P/B + EV/EBITDA, "
-                "and (3) a 5×5 WACC × terminal-growth sensitivity grid. Returns a blended implied "
-                "price weighted by sector (e.g. banks lean relative-heavy; staples lean DCF-heavy) "
-                "plus an opinionated UNDER/FAIR/OVERVALUED verdict. "
-                "Defaults: 12% WACC, 5% terminal growth, default peer set per sector."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    },
-                    "discount_rate": {
-                        "type": "number",
-                        "description": "WACC / required return in % (default 12).",
-                        "default": 12.0,
-                    },
-                    "terminal_growth": {
-                        "type": "number",
-                        "description": "Long-term terminal growth rate in % (default 5).",
-                        "default": 5.0,
-                    },
-                    "bull_growth": {
-                        "type": "number",
-                        "description": "Annual FCF growth in % for bull scenario (default 20).",
-                        "default": 20.0,
-                    },
-                    "base_growth": {
-                        "type": "number",
-                        "description": "Annual FCF growth in % for base scenario (default 12).",
-                        "default": 12.0,
-                    },
-                    "bear_growth": {
-                        "type": "number",
-                        "description": "Annual FCF growth in % for bear scenario (default 5).",
-                        "default": 5.0,
-                    },
-                    "projection_years": {
-                        "type": "integer",
-                        "description": "Years to project FCF (default 5).",
-                        "default": 5,
-                    },
-                    "peers": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional explicit peer tickers for relative valuation. If omitted, default peer set for the sector is used.",
-                    },
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="get_position_sizing",
-            description=(
-                "Calculate optimal position size for a VN stock trade using ATR-based stop-loss "
-                "and fixed-fractional risk management. Returns max shares, position value, "
-                "portfolio weight, stop-loss level, and risk/reward at key targets. "
-                "Use this (Phase 3) before entering any new position to enforce capital discipline."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    },
-                    "portfolio_value": {
-                        "type": "number",
-                        "description": "Total portfolio value in VND (e.g. 500000000 for 500M VND).",
-                    },
-                    "risk_per_trade_pct": {
-                        "type": "number",
-                        "description": "Max % of portfolio to risk on this trade (default 2.0).",
-                        "default": 2.0,
-                    },
-                    "conviction": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high"],
-                        "description": "Conviction level — scales risk: low 0.5x, medium 1x, high 1.5x.",
-                        "default": "medium",
-                    },
-                    "atr_multiplier": {
-                        "type": "number",
-                        "description": "ATR multiplier for stop-loss distance from entry (default 2.0).",
-                        "default": 2.0,
-                    },
-                },
-                "required": ["ticker", "portfolio_value"],
-            },
-        ),
-        types.Tool(
-            name="save_investment_thesis",
-            description=(
-                "Save a structured investment thesis for a VN stock to the theses/ folder. "
-                "Captures the investment rationale, price targets, stop-loss, conviction level, "
-                "and — critically — falsification criteria: the specific conditions that would break the thesis. "
-                "Phase 4 discipline: always write the thesis before entering a position, "
-                "and review it before adding to or exiting a position."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    },
-                    "thesis": {
-                        "type": "string",
-                        "description": "Core investment thesis — why you're buying, the moat, and what must remain true.",
-                    },
-                    "buy_price": {
-                        "type": "number",
-                        "description": "Entry price or range in VND.",
-                    },
-                    "target_price": {
-                        "type": "number",
-                        "description": "12-month price target in VND.",
-                    },
-                    "stop_price": {
-                        "type": "number",
-                        "description": "Stop-loss / exit price in VND — the line where the thesis is broken.",
-                    },
-                    "conviction": {
-                        "type": "string",
-                        "enum": ["Low", "Medium", "High"],
-                        "description": "Conviction level (default Medium).",
-                        "default": "Medium",
-                    },
-                    "falsification_criteria": {
-                        "type": "string",
-                        "description": "Specific, testable conditions that invalidate this thesis (e.g. 'ROE drops below 15%', 'revenue growth < 10% for 2 consecutive quarters').",
-                    },
-                    "catalysts": {
-                        "type": "string",
-                        "description": "2-3 upcoming events that could prove the thesis right.",
-                        "default": "",
-                    },
-                    "strongest_bias": {
-                        "type": "string",
-                        "description": "Pre-mortem: which cognitive bias is most likely affecting this thesis? (e.g. 'recency bias from recent rally', 'confirmation bias — I want this to work', 'anchoring on prior target').",
-                        "default": "",
-                    },
-                    "premortem_reason": {
-                        "type": "string",
-                        "description": "Pre-mortem: if this thesis is wrong 12 months from now, what is the SINGLE most likely reason? Be specific.",
-                        "default": "",
-                    },
-                },
-                "required": ["ticker", "thesis", "buy_price", "target_price", "stop_price", "falsification_criteria"],
-            },
-        ),
-        types.Tool(
-            name="get_earnings_quality",
-            description=(
-                "Score earnings quality for a VN-listed stock on five dimensions: FCF/NI ratio, "
-                "accruals ratio (Sloan), OCF margin, working capital trend, and OCF coverage. "
-                "Returns a 0-100 quality score with verdict. Phase 2 tool — separates genuine cash earnings "
-                "from accounting-driven profit. Lower accruals = higher quality."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string", "description": "VN ticker symbol (e.g. FPT)."},
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="get_foreign_flow",
-            description=(
-                "Show foreign investor activity for a VN-listed stock: current ownership %, "
-                "foreign room remaining, and today's foreign buy/sell snapshot from price_board. "
-                "Foreign net flow is one of the strongest leading signals on HOSE — "
-                "sustained foreign accumulation in large-caps often precedes price moves."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string", "description": "VN ticker symbol (e.g. FPT)."},
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="get_vn_macro_indicators",
-            description=(
-                "Fetch Vietnam macroeconomic indicators from the World Bank API: GDP growth rate, "
-                "CPI inflation, real interest rate, and unemployment for the last ~10 years. "
-                "Phase 1 macro context — use to spot regime shifts (inflation rising, growth slowing) "
-                "before they show up in stock prices."
-            ),
-            inputSchema={"type": "object", "properties": {}, "required": []},
-        ),
-        types.Tool(
-            name="get_quality_score",
-            description=(
-                "Compute a single 0-100 quality score for a VN stock from: ROIC, FCF/NI, debt/equity, "
-                "revenue CAGR, and gross margin stability. Phase 4 pattern recognition tool — use to "
-                "screen for compounders quickly and rank watchlist candidates."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string", "description": "VN ticker symbol (e.g. FPT)."},
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="stress_test_portfolio",
-            description=(
-                "Simulate portfolio P&L under three market shock scenarios: -10%, -20%, -30% VN-Index decline. "
-                "Applies sector beta proxies (banking 1.1, real estate 1.4, tech 1.2, staples 0.7) to each holding. "
-                "Returns total loss in VND, by-position breakdown, and triggers drawdown rule warnings."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "holdings": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "ticker":    {"type": "string"},
-                                "shares":    {"type": "number"},
-                                "avg_cost":  {"type": "number"},
-                            },
-                            "required": ["ticker", "shares", "avg_cost"],
-                        },
-                        "description": "List of holdings, e.g. [{\"ticker\":\"FPT\",\"shares\":1000,\"avg_cost\":130000}].",
-                    },
-                },
-                "required": ["holdings"],
-            },
-        ),
-        types.Tool(
-            name="manage_watchlist",
-            description=(
-                "Add, remove, or list tickers in your personal watchlist (stored in .watchlist.json). "
-                "Use `check_watchlist` afterwards to scan all tickers for technical triggers."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["add", "remove", "list", "clear"]},
-                    "ticker": {"type": "string", "description": "Required for add/remove. Ignored for list/clear."},
-                },
-                "required": ["action"],
-            },
-        ),
-        types.Tool(
-            name="check_watchlist",
-            description=(
-                "Scan every ticker in your watchlist for actionable technical triggers: RSI <30 (oversold), "
-                "RSI >70 (overbought), MA50 break (above or below), and >5% daily moves. "
-                "Run at the start of every session to surface what's worth attention."
-            ),
-            inputSchema={"type": "object", "properties": {}, "required": []},
-        ),
-        types.Tool(
-            name="correlate_news_to_price",
-            description=(
-                "Quantify how a ticker's news flow relates to its price action. "
-                "Pulls articles + daily prices over the lookback window, scores each article's "
-                "sentiment (keyword-based, VN + EN), then computes cross-correlation at lags "
-                "−2/−1/0/+1/+2 days between news volume + net sentiment and returns. "
-                "Tells you whether news LEADS price (information edge), REACTS to price (noise), "
-                "or is uncorrelated (irrelevant). Surfaces spike days with headlines."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string", "description": "VN ticker symbol (uppercase, e.g. FPT)."},
-                    "lookback_days": {"type": "integer", "default": 90,
-                                      "description": "Trading days to analyze (default 90; min 30 for statistical signal)."},
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="thesis_context",
-            description=(
-                "Bundle pre-thesis context for a VN ticker: recent news mentioning it, your existing "
-                "analyses/theses, and matching sector principles from the knowledge base (Buffett, Marks, "
-                "Damodaran). Call this FIRST when writing a new thesis or revisiting an existing position — "
-                "it surfaces what you already know and what the corpus says about similar businesses, "
-                "saving you 30-60 min of recall."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string", "description": "VN ticker symbol (uppercase, e.g. FPT)."},
-                    "lookback_days": {"type": "integer", "default": 30, "description": "How far back to pull news (default 30)."},
-                    "max_articles": {"type": "integer", "default": 15, "description": "Cap on recent articles included (default 15)."},
-                    "include_sector_principles": {"type": "boolean", "default": True,
-                                                  "description": "Include matching passages from books/blogs (Buffett, Marks, etc.)."},
-                },
-                "required": ["ticker"],
-            },
-        ),
-        types.Tool(
-            name="compare_authors_on",
-            description=(
-                "Cross-reference engine: for a topic and a list of authors, pull every passage from each "
-                "author's corpus discussing that topic. Use this to learn where investing legends actually "
-                "DISAGREE — Marks vs Buffett on cyclicality, Damodaran vs Mauboussin on growth, etc. "
-                "Returns a structured markdown block with passages grouped by author and ready for synthesis."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "topic": {"type": "string", "description": "Topic to compare, e.g. 'cyclicality' or 'intrinsic value'."},
-                    "authors": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of author names (substring match, e.g. ['Warren Buffett', 'Howard Marks']).",
-                        "minItems": 1,
-                    },
-                    "keywords": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional explicit keyword list. If omitted, the topic plus naive synonyms are used.",
-                    },
-                    "context_paragraphs": {"type": "integer", "default": 2,
-                                           "description": "Paragraphs of surrounding context per match (default 2)."},
-                    "max_per_author": {"type": "integer", "default": 5,
-                                       "description": "Cap on passages per author (default 5)."},
-                },
-                "required": ["topic", "authors"],
-            },
-        ),
-        types.Tool(
-            name="review_performance",
-            description=(
-                "Audit your decision journal: parse decisions/LOG.md, pair buys with sells to compute "
-                "realized P&L, calculate win rate / expectancy / max consecutive losses, surface stale "
-                "pending decisions (>90 days), cluster losses by ticker and hold period, and output "
-                "an opinionated triage verdict (e.g. 'holding losers too long', 'low hit rate'). "
-                "Phase 4 performance review — call this monthly or after every 10 closed trades."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "lookback_days": {
-                        "type": "integer",
-                        "description": "How many days back to include in the review (default 365).",
-                        "default": 365,
-                    },
-                },
-                "required": [],
-            },
-        ),
-        types.Tool(
-            name="save_decision_log",
-            description=(
-                "Log a buy/sell/add/trim/hold decision to decisions/LOG.md. "
-                "Recording decisions with rationale at execution time is the foundation of Phase 4 "
-                "performance review — it lets you audit your thinking vs. what actually happened. "
-                "Call this every time you act on a position. Update the outcome field later when resolved."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ticker": {
-                        "type": "string",
-                        "description": "VN stock ticker symbol (uppercase, e.g. FPT).",
-                    },
-                    "action": {
-                        "type": "string",
-                        "enum": ["BUY", "SELL", "ADD", "TRIM", "HOLD"],
-                        "description": "Action taken.",
-                    },
-                    "price": {
-                        "type": "number",
-                        "description": "Execution price in VND.",
-                    },
-                    "rationale": {
-                        "type": "string",
-                        "description": "Why you're taking this action right now — cite the specific evidence.",
-                    },
-                    "quantity": {
-                        "type": "integer",
-                        "description": "Number of shares (optional).",
-                        "default": 0,
-                    },
-                    "outcome": {
-                        "type": "string",
-                        "description": "Leave blank for new entries. Fill in later: 'Correct — stock rose 25%' or 'Wrong — thesis broken at Q3 earnings'.",
-                        "default": "",
-                    },
-                },
-                "required": ["ticker", "action", "price", "rationale"],
-            },
-        ),
-    ]
+    return get_all_specs()
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent | types.ImageContent]:
-    if name == "load_financial_pdf":
-        return await _load_financial_pdf(arguments)
-    elif name == "get_stock_overview":
-        return await _get_stock_overview(arguments)
-    elif name == "get_financial_data":
-        return await _get_financial_data(arguments)
-    elif name == "get_analysis_prompt":
-        return await _get_analysis_prompt(arguments)
-    elif name == "save_analysis":
-        return await _save_analysis(arguments)
-    elif name == "get_technical_analysis":
-        return await _get_technical_analysis(arguments)
-    elif name == "fetch_broker_news":
-        return await _fetch_broker_news(arguments)
-    elif name == "compare_stocks":
-        return await _compare_stocks(arguments)
-    elif name == "get_macro_data":
-        return await _get_macro_data(arguments)
-    elif name == "get_commodity_prices":
-        return await _get_commodity_prices(arguments)
-    elif name == "get_market_news":
-        return await _get_market_news(arguments)
-    elif name == "get_market_overview":
-        return await _get_market_overview(arguments)
-    elif name == "get_economy_news":
-        return await _get_economy_news(arguments)
-    elif name == "get_dcf_valuation":
-        return await _get_dcf_valuation(arguments)
-    elif name == "get_position_sizing":
-        return await _get_position_sizing(arguments)
-    elif name == "save_investment_thesis":
-        return await _save_investment_thesis(arguments)
-    elif name == "save_decision_log":
-        return await _save_decision_log(arguments)
-    elif name == "review_performance":
-        return await _review_performance(arguments)
-    elif name == "get_earnings_quality":
-        return await _get_earnings_quality(arguments)
-    elif name == "get_foreign_flow":
-        return await _get_foreign_flow(arguments)
-    elif name == "get_vn_macro_indicators":
-        return await _get_vn_macro_indicators(arguments)
-    elif name == "get_quality_score":
-        return await _get_quality_score(arguments)
-    elif name == "stress_test_portfolio":
-        return await _stress_test_portfolio(arguments)
-    elif name == "manage_watchlist":
-        return await _manage_watchlist(arguments)
-    elif name == "check_watchlist":
-        return await _check_watchlist(arguments)
-    elif name == "thesis_context":
-        return await _thesis_context(arguments)
-    elif name == "compare_authors_on":
-        return await _compare_authors_on(arguments)
-    elif name == "correlate_news_to_price":
-        return await _correlate_news_to_price(arguments)
-    else:
-        raise ValueError(f"Unknown tool: {name}")
+    return await dispatch(name, arguments)
 
 
+@register_tool(
+    name='load_financial_pdf',
+    description='Load a financial statement PDF from a local file path or URL. Returns each page as an image so you can visually read and analyze the financial data (income statement, balance sheet, cash flow, etc.). Use this for VN company annual reports and quarterly financial statements.',
+    input_schema={'type': 'object', 'properties': {'source': {'type': 'string', 'description': 'Absolute local file path (e.g. /Users/you/fpt_2024.pdf) or HTTPS URL to the PDF.'}, 'max_pages': {'type': 'integer', 'description': 'Maximum number of pages to return (default 20, max 40).', 'default': 20}}, 'required': ['source']},
+)
 async def _load_financial_pdf(args: dict) -> list:
     source: str = args["source"]
     max_pages: int = min(int(args.get("max_pages", 20)), 40)
@@ -917,6 +148,11 @@ async def _load_financial_pdf(args: dict) -> list:
     return result
 
 
+@register_tool(
+    name='get_stock_overview',
+    description='Get a quick overview of a Vietnam-listed stock: current price, market cap, P/E, P/B, 52-week range, and exchange (HOSE/HNX/UPCOM). Ticker examples: VIC, FPT, HPG, VNM, MWG.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}}, 'required': ['ticker']},
+)
 async def _get_stock_overview(args: dict) -> list[types.TextContent]:
     ticker: str = args["ticker"].upper()
     try:
@@ -1018,6 +254,11 @@ def _format_statement(df, key_items: list[str]) -> str:
     return "\n".join([header, divider] + rows)
 
 
+@register_tool(
+    name='get_financial_data',
+    description='Fetch structured financial statements for a VN-listed company: income statement, balance sheet, and cash flow statement. Returns multiple periods so you can spot trends.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'period': {'type': 'string', 'enum': ['year', 'quarter'], 'description': 'Annual or quarterly data (default: year).', 'default': 'year'}}, 'required': ['ticker']},
+)
 async def _get_financial_data(args: dict) -> list[types.TextContent]:
     ticker: str = args["ticker"].upper()
     period: str = args.get("period", "year")
@@ -1056,6 +297,11 @@ THESES_DIR    = Path(__file__).parent / "theses"
 DECISIONS_DIR = Path(__file__).parent / "decisions"
 
 
+@register_tool(
+    name='save_analysis',
+    description="Save a completed stock analysis as a Markdown file in the project's analyses/ folder. Call this AFTER finishing the analysis to persist it as memory for future sessions.",
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'content': {'type': 'string', 'description': 'Full analysis in Markdown format.'}, 'period': {'type': 'string', 'description': "Report period label, e.g. 'Q1-2026' or '2025-annual'. Used in filename.", 'default': ''}}, 'required': ['ticker', 'content']},
+)
 async def _save_analysis(args: dict) -> list[types.TextContent]:
     ticker = args["ticker"].upper()
     content = args["content"]
@@ -1087,6 +333,11 @@ async def _save_analysis(args: dict) -> list[types.TextContent]:
     )]
 
 
+@register_tool(
+    name='get_technical_analysis',
+    description='Compute technical analysis for a VN-listed stock using up to 1 year of daily price data. Returns trend, moving averages (MA20/50/200), RSI, MACD, Bollinger Bands, ATR, volume profile, support/resistance levels, and an overall technical signal.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'days': {'type': 'integer', 'description': 'Number of trading days of history to use (default 365).', 'default': 365}}, 'required': ['ticker']},
+)
 async def _get_technical_analysis(args: dict) -> list[types.TextContent]:
     ticker = args["ticker"].upper()
     days = int(args.get("days", 365))
@@ -1250,6 +501,11 @@ async def _get_technical_analysis(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=text)]
 
 
+@register_tool(
+    name='fetch_broker_news',
+    description='Fetch recent news, corporate events, insider trades, and analyst consensus for a VN-listed stock. Aggregates from FiinGroup (via vnstock) which covers disclosures from SSI, TCBS, Mirae Asset, VCBS and other local brokers. Optionally load a broker research report PDF by providing its URL or local path.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'limit': {'type': 'integer', 'description': 'Number of recent news items to return (default 15).', 'default': 15}, 'broker_pdf_url': {'type': 'string', 'description': 'Optional: URL or local path to a broker research report PDF to load alongside the news.'}}, 'required': ['ticker']},
+)
 async def _fetch_broker_news(args: dict) -> list:
     ticker = args["ticker"].upper()
     limit = int(args.get("limit", 15))
@@ -1506,6 +762,11 @@ def _fmt(val, fmt=".1f", suffix="", na="N/A"):
         return na
 
 
+@register_tool(
+    name='compare_stocks',
+    description='Fetch and compare key financial metrics side-by-side for multiple VN-listed stocks. Use this to rank peers by valuation, profitability, growth, and financial health. Returns a structured comparison table ready for expert analysis.',
+    input_schema={'type': 'object', 'properties': {'tickers': {'type': 'array', 'items': {'type': 'string'}, 'description': "List of VN stock tickers to compare (e.g. ['FPT', 'CMG', 'VGI']).", 'minItems': 2, 'maxItems': 8}, 'period': {'type': 'string', 'enum': ['year', 'quarter'], 'default': 'year', 'description': 'Annual or most-recent-quarter comparison.'}}, 'required': ['tickers']},
+)
 async def _compare_stocks(args: dict) -> list[types.TextContent]:
     tickers = [t.upper() for t in args["tickers"]]
     period = args.get("period", "year")
@@ -1587,6 +848,11 @@ _BTMC_PRODUCTS = {
 }
 
 
+@register_tool(
+    name='get_macro_data',
+    description='Fetch live Vietnamese macroeconomic data: USD/VND and major currency exchange rates from Vietcombank, plus the SBV base interest rate context. Use this when analyzing currency risk, import/export companies, or macro environment.',
+    input_schema={'type': 'object', 'properties': {}, 'required': []},
+)
 async def _get_macro_data(_args: dict) -> list[types.TextContent]:
     import xml.etree.ElementTree as ET
 
@@ -1632,6 +898,11 @@ async def _get_macro_data(_args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text="\n".join(lines))]
 
 
+@register_tool(
+    name='get_commodity_prices',
+    description='Fetch live commodity prices relevant to Vietnam: SJC gold (miếng), BTMC gold, silver, and key precious metals in VND per lượng. Use this for gold-related stocks (PNJ, SJC), inflation analysis, or macro context.',
+    input_schema={'type': 'object', 'properties': {}, 'required': []},
+)
 async def _get_commodity_prices(_args: dict) -> list[types.TextContent]:
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=10) as c:
@@ -1694,6 +965,8 @@ _RSS_FEEDS = [
     ("Tin Nhanh CK",          "https://tinnhanhchungkhoan.vn/rss/"),
     ("VnExpress Business",    "https://e.vnexpress.net/rss/business.rss"),
     ("Vietnam Inv. Review",   "https://vir.com.vn/rss_feed/"),
+    ("Stockbiz EN - Company", "http://en.stockbiz.vn/RSS/News/Company.ashx"),
+    ("Stockbiz EN - Market",  "http://en.stockbiz.vn/RSS/News/Market.ashx"),
 ]
 
 # High-signal economic & investment feeds — used by get_economy_news
@@ -1710,6 +983,9 @@ _ECONOMY_FEEDS = [
     ("Tin Nhanh CK",               "https://tinnhanhchungkhoan.vn/rss/"),
     ("VnExpress Business",         "https://e.vnexpress.net/rss/business.rss"),
     ("Vietnam Inv. Review",        "https://vir.com.vn/rss_feed/"),
+    ("Stockbiz EN - TopStories",  "http://en.stockbiz.vn/RSS/News/TopStories.ashx"),
+    ("Stockbiz EN - Economy",     "http://en.stockbiz.vn/RSS/News/Economy.ashx"),
+    ("Stockbiz EN - Financial",   "http://en.stockbiz.vn/RSS/News/Financial.ashx"),
 ]
 
 _RSS_HEADERS = {
@@ -1777,6 +1053,11 @@ async def _fetch_one_rss(client: httpx.AsyncClient, source: str, url: str, ticke
     return items
 
 
+@register_tool(
+    name='get_market_news',
+    description='Crawl Vietnamese financial news sites (CafeF, Tin Nhanh Chứng Khoán, VnExpress, Vietnam Investment Review, VietStock) via RSS and return recent articles that mention the stock ticker. Complements fetch_broker_news (which pulls from vnstock/FiinGroup) with broader editorial coverage from independent news outlets. Use this to gauge media sentiment, spot breaking news, or find analyst commentary not covered by broker disclosures.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'limit': {'type': 'integer', 'description': 'Maximum number of articles to return (default 20).', 'default': 20}}, 'required': ['ticker']},
+)
 async def _get_market_news(args: dict) -> list[types.TextContent]:
     ticker = args["ticker"].upper()
     limit = int(args.get("limit", 20))
@@ -1823,6 +1104,11 @@ async def _get_market_news(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text="\n".join(lines))]
 
 
+@register_tool(
+    name='get_analysis_prompt',
+    description="Returns a structured analysis framework to guide a deep-dive of a VN stock. Call this FIRST when the user asks to 'analyze' a stock, then use the other tools to gather data and follow the framework step by step.",
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'mode': {'type': 'string', 'enum': ['full', 'quick', 'pdf'], 'description': 'full = structured data + PDF report (default); quick = structured data only, no PDF; pdf = PDF report only.', 'default': 'full'}, 'pdf_path': {'type': 'string', 'description': 'Optional path or URL to a financial statement PDF for pdf/full modes.'}}, 'required': ['ticker']},
+)
 async def _get_analysis_prompt(args: dict) -> list[types.TextContent]:
     ticker = args["ticker"].upper()
     mode = args.get("mode", "full")
@@ -1977,12 +1263,28 @@ After completing all sections, call:
     return [types.TextContent(type="text", text=prompt)]
 
 
-_MARKET_WATCH = [
-    "VCB", "BID", "TCB", "MBB", "VPB",   # Banking
-    "VIC", "VHM",                           # Real Estate
-    "FPT", "HPG", "VNM",                   # Tech / Steel / Consumer staples
-    "MWG", "GAS", "PLX", "MSN", "SAB",    # Retail / Energy / Consumer
-]
+_HTML_TAG_RE = None
+_HTML_ENTITIES = {"&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&nbsp;": " ", "&hellip;": "…"}
+
+
+def _clean_rss_summary(raw: str, max_chars: int = 220) -> str:
+    """Strip HTML tags and entities from an RSS description, truncate cleanly."""
+    global _HTML_TAG_RE
+    if _HTML_TAG_RE is None:
+        import re
+        _HTML_TAG_RE = re.compile(r"<[^>]+>")
+    if not raw:
+        return ""
+    text = _HTML_TAG_RE.sub(" ", raw)
+    for entity, char in _HTML_ENTITIES.items():
+        text = text.replace(entity, char)
+    import re
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    last_space = cut.rfind(" ")
+    return (cut[:last_space] if last_space > max_chars * 0.6 else cut).rstrip() + "…"
 
 
 async def _fetch_headlines_from_rss(
@@ -2010,6 +1312,7 @@ async def _fetch_headlines_from_rss(
         if not link:
             link = item.findtext("guid", "").strip()
         pub_date = item.findtext("pubDate", "").strip()
+        summary = _clean_rss_summary(item.findtext("description", "") or "")
         if title:
             items.append({
                 "source": source,
@@ -2017,12 +1320,18 @@ async def _fetch_headlines_from_rss(
                 "title": title,
                 "link": link,
                 "date": pub_date[:22] if pub_date else "",
+                "summary": summary,
             })
         if len(items) >= limit:
             break
     return items
 
 
+@register_tool(
+    name='get_market_overview',
+    description="Show how the Vietnamese stock market is performing today. Returns VN-Index, HNX-Index, and UPCOM index levels with today's change (points and %), plus top gainers and losers from major large-cap stocks. Use this for a quick market pulse check before or after a session.",
+    input_schema={'type': 'object', 'properties': {}, 'required': []},
+)
 async def _get_market_overview(_args: dict) -> list[types.TextContent]:
     from datetime import date, datetime, timezone, timedelta
 
@@ -2149,6 +1458,11 @@ async def _get_market_overview(_args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text="\n".join(lines))]
 
 
+@register_tool(
+    name='get_economy_news',
+    description="Fetch today's top economic and financial headlines from high-signal Vietnamese sources: VnEconomy (tạp chí Kinh tế Việt Nam), Báo Đầu tư, CafeF, Tin Nhanh Chứng Khoán, VnExpress Business, and Vietnam Investment Review. Returns a balanced feed of general market-moving news — macro policy, banking, corporate events, FDI, interest rates — not filtered by ticker. Use this for a broad economic pulse or when the user asks 'what's happening in the economy today'.",
+    input_schema={'type': 'object', 'properties': {'limit': {'type': 'integer', 'description': 'Max headlines to return (default 20).', 'default': 20}}, 'required': []},
+)
 async def _get_economy_news(args: dict) -> list[types.TextContent]:
     from datetime import datetime, timezone, timedelta
 
@@ -2201,48 +1515,32 @@ async def _get_economy_news(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text="\n".join(lines))]
 
 
-# Sector lookup uses lowercase substring match against vnstock's sector strings
-# (which vary: "Banks" vs "Banking", "Real Estate" vs "Real Estate Development", etc.)
-# Key = lowercase substring to look for in vnstock sector string.
+async def _get_economy_news_articles(limit: int = 50) -> list[dict]:
+    per_source_cap = max(2, limit // len(_ECONOMY_FEEDS) + 1)
 
-_SECTOR_PEER_SET: list[tuple[str, list[str]]] = [
-    ("technolog",          ["FPT", "CMG", "VGI", "ITD", "ELC"]),
-    ("bank",               ["VCB", "BID", "CTG", "TCB", "MBB", "ACB", "STB", "VPB", "HDB"]),
-    ("real estate",        ["VIC", "VHM", "NLG", "KDH", "DXG", "DIG"]),
-    ("steel",              ["HPG", "HSG", "NKG"]),
-    ("material",           ["HPG", "HSG", "DGC"]),
-    ("staple",             ["VNM", "SAB", "MSN"]),
-    ("discretionary",      ["MWG", "FRT", "PNJ"]),
-    ("retail",             ["MWG", "FRT", "PNJ"]),
-    ("aviation",           ["VJC", "HVN"]),
-    ("airline",            ["VJC", "HVN"]),
-    ("industrial",         ["GVR", "PHR"]),
-    ("energy",             ["GAS", "PLX", "BSR"]),
-    ("oil",                ["GAS", "PLX", "BSR", "PVD", "PVS"]),
-    ("telecom",            ["VGI", "CTR"]),
-]
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        batches = await asyncio.gather(
+            *[_fetch_headlines_from_rss(client, name, url, limit=per_source_cap)
+              for name, url in _ECONOMY_FEEDS],
+            return_exceptions=True,
+        )
 
-_VALUATION_WEIGHTS: list[tuple[str, dict[str, float]]] = [
-    ("bank",               {"dcf": 0.1, "relative": 0.9}),  # DCF nonsensical for banks (deposit flows in OCF)
-    ("insurance",          {"dcf": 0.1, "relative": 0.9}),
-    ("real estate",        {"dcf": 0.2, "relative": 0.8}),  # NAV-based ideally
-    ("aviation",           {"dcf": 0.2, "relative": 0.8}),
-    ("airline",            {"dcf": 0.2, "relative": 0.8}),
-    ("steel",              {"dcf": 0.3, "relative": 0.7}),  # cyclical
-    ("material",           {"dcf": 0.3, "relative": 0.7}),
-    ("energy",             {"dcf": 0.3, "relative": 0.7}),
-    ("oil",                {"dcf": 0.3, "relative": 0.7}),
-    ("discretionary",      {"dcf": 0.4, "relative": 0.6}),
-    ("retail",             {"dcf": 0.4, "relative": 0.6}),
-    ("staple",             {"dcf": 0.6, "relative": 0.4}),  # durable franchise → DCF more reliable
-    ("technolog",          {"dcf": 0.5, "relative": 0.5}),
-    ("telecom",            {"dcf": 0.5, "relative": 0.5}),
-    ("industrial",         {"dcf": 0.5, "relative": 0.5}),
-]
-_DEFAULT_WEIGHTS = {"dcf": 0.5, "relative": 0.5}
+    seen_titles: set = set()
+    per_source: dict = {}
+    articles: list = []
+    for batch in batches:
+        if not isinstance(batch, list):
+            continue
+        for item in batch:
+            key = item["title"].lower()
+            src = item["source"]
+            if key not in seen_titles and per_source.get(src, 0) < per_source_cap:
+                seen_titles.add(key)
+                per_source[src] = per_source.get(src, 0) + 1
+                articles.append(item)
 
-# Sectors where DCF is structurally unreliable — surface a strong warning
-_DCF_UNRELIABLE_KEYS = ["bank", "insurance", "real estate"]
+    return articles[:limit]
+
 
 
 def _lookup_sector_peers(sector: str) -> list[str]:
@@ -2347,6 +1645,11 @@ def _compute_sensitivity_grid(
     }
 
 
+@register_tool(
+    name='get_dcf_valuation',
+    description='Triangulated intrinsic value for a VN-listed stock combining (1) DCF with bull/base/bear scenarios, (2) peer-relative valuation via median P/E + P/B + EV/EBITDA, and (3) a 5×5 WACC × terminal-growth sensitivity grid. Returns a blended implied price weighted by sector (e.g. banks lean relative-heavy; staples lean DCF-heavy) plus an opinionated UNDER/FAIR/OVERVALUED verdict. Defaults: 12% WACC, 5% terminal growth, default peer set per sector.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'discount_rate': {'type': 'number', 'description': 'WACC / required return in % (default 12).', 'default': 12.0}, 'terminal_growth': {'type': 'number', 'description': 'Long-term terminal growth rate in % (default 5).', 'default': 5.0}, 'bull_growth': {'type': 'number', 'description': 'Annual FCF growth in % for bull scenario (default 20).', 'default': 20.0}, 'base_growth': {'type': 'number', 'description': 'Annual FCF growth in % for base scenario (default 12).', 'default': 12.0}, 'bear_growth': {'type': 'number', 'description': 'Annual FCF growth in % for bear scenario (default 5).', 'default': 5.0}, 'projection_years': {'type': 'integer', 'description': 'Years to project FCF (default 5).', 'default': 5}, 'peers': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Optional explicit peer tickers for relative valuation. If omitted, default peer set for the sector is used.'}}, 'required': ['ticker']},
+)
 async def _get_dcf_valuation(args: dict) -> list[types.TextContent]:
     ticker: str = args["ticker"].upper()
     discount_rate: float = float(args.get("discount_rate", 12.0)) / 100
@@ -2740,6 +2043,11 @@ async def _get_dcf_valuation(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=text)]
 
 
+@register_tool(
+    name='get_position_sizing',
+    description='Calculate optimal position size for a VN stock trade using ATR-based stop-loss and fixed-fractional risk management. Returns max shares, position value, portfolio weight, stop-loss level, and risk/reward at key targets. Use this (Phase 3) before entering any new position to enforce capital discipline.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'portfolio_value': {'type': 'number', 'description': 'Total portfolio value in VND (e.g. 500000000 for 500M VND).'}, 'risk_per_trade_pct': {'type': 'number', 'description': 'Max % of portfolio to risk on this trade (default 2.0).', 'default': 2.0}, 'conviction': {'type': 'string', 'enum': ['low', 'medium', 'high'], 'description': 'Conviction level — scales risk: low 0.5x, medium 1x, high 1.5x.', 'default': 'medium'}, 'atr_multiplier': {'type': 'number', 'description': 'ATR multiplier for stop-loss distance from entry (default 2.0).', 'default': 2.0}}, 'required': ['ticker', 'portfolio_value']},
+)
 async def _get_position_sizing(args: dict) -> list[types.TextContent]:
     ticker: str          = args["ticker"].upper()
     portfolio_value: float = float(args["portfolio_value"])
@@ -2837,6 +2145,11 @@ async def _get_position_sizing(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=text)]
 
 
+@register_tool(
+    name='save_investment_thesis',
+    description='Save a structured investment thesis for a VN stock to the theses/ folder. Captures the investment rationale, price targets, stop-loss, conviction level, and — critically — falsification criteria: the specific conditions that would break the thesis. Phase 4 discipline: always write the thesis before entering a position, and review it before adding to or exiting a position.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'thesis': {'type': 'string', 'description': "Core investment thesis — why you're buying, the moat, and what must remain true."}, 'buy_price': {'type': 'number', 'description': 'Entry price or range in VND.'}, 'target_price': {'type': 'number', 'description': '12-month price target in VND.'}, 'stop_price': {'type': 'number', 'description': 'Stop-loss / exit price in VND — the line where the thesis is broken.'}, 'conviction': {'type': 'string', 'enum': ['Low', 'Medium', 'High'], 'description': 'Conviction level (default Medium).', 'default': 'Medium'}, 'falsification_criteria': {'type': 'string', 'description': "Specific, testable conditions that invalidate this thesis (e.g. 'ROE drops below 15%', 'revenue growth < 10% for 2 consecutive quarters')."}, 'catalysts': {'type': 'string', 'description': '2-3 upcoming events that could prove the thesis right.', 'default': ''}, 'strongest_bias': {'type': 'string', 'description': "Pre-mortem: which cognitive bias is most likely affecting this thesis? (e.g. 'recency bias from recent rally', 'confirmation bias — I want this to work', 'anchoring on prior target').", 'default': ''}, 'premortem_reason': {'type': 'string', 'description': 'Pre-mortem: if this thesis is wrong 12 months from now, what is the SINGLE most likely reason? Be specific.', 'default': ''}}, 'required': ['ticker', 'thesis', 'buy_price', 'target_price', 'stop_price', 'falsification_criteria']},
+)
 async def _save_investment_thesis(args: dict) -> list[types.TextContent]:
     ticker: str                = args["ticker"].upper()
     thesis: str                = args["thesis"]
@@ -2926,6 +2239,11 @@ async def _save_investment_thesis(args: dict) -> list[types.TextContent]:
     )]
 
 
+@register_tool(
+    name='save_decision_log',
+    description='Log a buy/sell/add/trim/hold decision to decisions/LOG.md. Recording decisions with rationale at execution time is the foundation of Phase 4 performance review — it lets you audit your thinking vs. what actually happened. Call this every time you act on a position. Update the outcome field later when resolved.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'action': {'type': 'string', 'enum': ['BUY', 'SELL', 'ADD', 'TRIM', 'HOLD'], 'description': 'Action taken.'}, 'price': {'type': 'number', 'description': 'Execution price in VND.'}, 'rationale': {'type': 'string', 'description': "Why you're taking this action right now — cite the specific evidence."}, 'quantity': {'type': 'integer', 'description': 'Number of shares (optional).', 'default': 0}, 'outcome': {'type': 'string', 'description': "Leave blank for new entries. Fill in later: 'Correct — stock rose 25%' or 'Wrong — thesis broken at Q3 earnings'.", 'default': ''}}, 'required': ['ticker', 'action', 'price', 'rationale']},
+)
 async def _save_decision_log(args: dict) -> list[types.TextContent]:
     ticker: str    = args["ticker"].upper()
     action: str    = args["action"].upper()
@@ -3188,6 +2506,11 @@ def _make_verdict(metrics: dict) -> tuple[str, str]:
     )
 
 
+@register_tool(
+    name='review_performance',
+    description="Audit your decision journal: parse decisions/LOG.md, pair buys with sells to compute realized P&L, calculate win rate / expectancy / max consecutive losses, surface stale pending decisions (>90 days), cluster losses by ticker and hold period, and output an opinionated triage verdict (e.g. 'holding losers too long', 'low hit rate'). Phase 4 performance review — call this monthly or after every 10 closed trades.",
+    input_schema={'type': 'object', 'properties': {'lookback_days': {'type': 'integer', 'description': 'How many days back to include in the review (default 365).', 'default': 365}}, 'required': []},
+)
 async def _review_performance(args: dict) -> list[types.TextContent]:
     lookback_days: int = int(args.get("lookback_days", 365))
 
@@ -3334,7 +2657,73 @@ async def _review_performance(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text="\n".join(lines))]
 
 
-WATCHLIST_PATH = Path(__file__).parent / ".watchlist.json"
+def _load_portfolio() -> dict:
+    if not PORTFOLIO_PATH.exists():
+        return {"holdings": [], "cash_vnd": 0.0, "peak_value": 0.0, "peak_date": ""}
+    try:
+        data = json.loads(PORTFOLIO_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"holdings": [], "cash_vnd": 0.0, "peak_value": 0.0, "peak_date": ""}
+    data.setdefault("holdings", [])
+    data.setdefault("cash_vnd", 0.0)
+    data.setdefault("peak_value", 0.0)
+    data.setdefault("peak_date", "")
+    return data
+
+
+def _save_portfolio(portfolio: dict) -> None:
+    PORTFOLIO_PATH.write_text(json.dumps(portfolio, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _load_snapshots() -> list[dict]:
+    if not SNAPSHOTS_PATH.exists():
+        return []
+    try:
+        data = json.loads(SNAPSHOTS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def _save_snapshots(snapshots: list[dict]) -> None:
+    SNAPSHOTS_PATH.write_text(json.dumps(snapshots, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _append_snapshot(total_value: float, equity_value: float, cash: float) -> None:
+    """Append or replace today's portfolio snapshot in .portfolio_snapshots.json."""
+    from datetime import date
+    today = date.today().isoformat()
+    snapshots = _load_snapshots()
+    snapshots = [s for s in snapshots if s.get("date") != today]
+    snapshots.append({
+        "date": today,
+        "total_value": round(total_value, 2),
+        "equity_value": round(equity_value, 2),
+        "cash": round(cash, 2),
+    })
+    snapshots.sort(key=lambda x: x.get("date", ""))
+    _save_snapshots(snapshots)
+
+
+async def _fetch_holding_snapshot(ticker: str) -> dict:
+    """Lightweight fetch: current price + sector for one ticker via company_overview."""
+    raw = await _vnstock_subprocess("company_overview", {"ticker": ticker})
+    try:
+        rows = json.loads(raw)
+        ov = rows[0] if isinstance(rows, list) and rows else {}
+    except (json.JSONDecodeError, IndexError):
+        return {"ticker": ticker, "name": ticker, "sector": "N/A", "current_price": 0.0}
+
+    def _f(v, d=0.0):
+        try: return float(v) if v is not None else d
+        except (TypeError, ValueError): return d
+
+    return {
+        "ticker": ticker,
+        "name": str(ov.get("organ_short_name") or ov.get("organ_name") or ticker),
+        "sector": str(ov.get("sector", "N/A")),
+        "current_price": _f(ov.get("current_price")),
+    }
 
 
 def _get_item_series(df, item_id: str) -> dict[str, float]:
@@ -3356,6 +2745,11 @@ def _get_item_series(df, item_id: str) -> dict[str, float]:
     return out
 
 
+@register_tool(
+    name='get_earnings_quality',
+    description='Score earnings quality for a VN-listed stock on five dimensions: FCF/NI ratio, accruals ratio (Sloan), OCF margin, working capital trend, and OCF coverage. Returns a 0-100 quality score with verdict. Phase 2 tool — separates genuine cash earnings from accounting-driven profit. Lower accruals = higher quality.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN ticker symbol (e.g. FPT).'}}, 'required': ['ticker']},
+)
 async def _get_earnings_quality(args: dict) -> list[types.TextContent]:
     ticker: str = args["ticker"].upper()
 
@@ -3476,6 +2870,11 @@ async def _get_earnings_quality(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=text)]
 
 
+@register_tool(
+    name='get_foreign_flow',
+    description="Show foreign investor activity for a VN-listed stock: current ownership %, foreign room remaining, and today's foreign buy/sell snapshot from price_board. Foreign net flow is one of the strongest leading signals on HOSE — sustained foreign accumulation in large-caps often precedes price moves.",
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN ticker symbol (e.g. FPT).'}}, 'required': ['ticker']},
+)
 async def _get_foreign_flow(args: dict) -> list[types.TextContent]:
     ticker: str = args["ticker"].upper()
     try:
@@ -3559,54 +2958,46 @@ async def _get_foreign_flow(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=text)]
 
 
-_WB_INDICATORS = {
-    "GDP growth (%)":         "NY.GDP.MKTP.KD.ZG",
-    "CPI inflation (%)":      "FP.CPI.TOTL.ZG",
-    "Real interest rate (%)": "FR.INR.RINR",
-    "Unemployment (%)":       "SL.UEM.TOTL.ZS",
-    "Current account (% GDP)":"BN.CAB.XOKA.GD.ZS",
-}
-
-
-async def _fetch_wb_indicator(client: httpx.AsyncClient, label: str, code: str) -> tuple[str, list[tuple[int, float]]]:
-    url = f"https://api.worldbank.org/v2/country/VNM/indicator/{code}?format=json&date=2015:2026&per_page=30"
-    try:
-        resp = await client.get(url, timeout=15)
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception:
-        return label, []
-
-    if not isinstance(payload, list) or len(payload) < 2:
-        return label, []
-    series = []
-    for entry in payload[1]:
-        year = entry.get("date")
-        val  = entry.get("value")
-        if year and val is not None:
-            try:
-                series.append((int(year), float(val)))
-            except (TypeError, ValueError):
-                continue
-    return label, sorted(series, key=lambda x: x[0], reverse=True)
-
-
+@register_tool(
+    name='get_vn_macro_indicators',
+    description='Fetch Vietnam macroeconomic indicators from the World Bank API: GDP growth rate, CPI inflation, real interest rate, and unemployment for the last ~10 years. Phase 1 macro context — use to spot regime shifts (inflation rising, growth slowing) before they show up in stock prices.',
+    input_schema={'type': 'object', 'properties': {}, 'required': []},
+)
 async def _get_vn_macro_indicators(_args: dict) -> list[types.TextContent]:
     async with httpx.AsyncClient(follow_redirects=True) as client:
         results = await asyncio.gather(*[
             _fetch_wb_indicator(client, label, code) for label, code in _WB_INDICATORS.items()
         ])
 
-    series_map: dict[str, list] = {label: series for label, series in results}
+    series_map: dict[str, list] = {label: series for label, series, _ in results}
+    freshness_map: dict[str, str] = {label: fr for label, _, fr in results}
 
     all_years = sorted({y for s in series_map.values() for y, _ in s}, reverse=True)[:6]
 
     if not all_years:
-        return [types.TextContent(type="text", text="Failed to fetch any World Bank indicators for Vietnam.")]
+        return [types.TextContent(
+            type="text",
+            text=(
+                "Failed to fetch World Bank indicators — WB API appears to be temporarily unavailable "
+                "(502 Bad Gateway is common when WB does maintenance). "
+                "Try again in a few minutes. The Vietnam bank credit signal in `get_money_supply` "
+                "does not depend on WB and remains available."
+            )
+        )]
+
+    stale_labels = [l for l, f in freshness_map.items() if f == "stale"]
+    unavailable_labels = [l for l, f in freshness_map.items() if f == "unavailable"]
+
+    source_note = "*Source: World Bank Open Data API (annual, lagged 1–2 years)*"
+    if stale_labels:
+        source_note += f"\n> ⚠️ **{len(stale_labels)} indicator(s) served from stale cache** (WB API temporarily unavailable): {', '.join(stale_labels)}"
+    if unavailable_labels:
+        source_note += f"\n> ❌ **{len(unavailable_labels)} indicator(s) unavailable** (no cache): {', '.join(unavailable_labels)}"
 
     lines = [
         "## Vietnam Macro Indicators",
-        "*Source: World Bank Open Data API (annual, lagged 1–2 years)*\n",
+        source_note,
+        "",
         "| Indicator | " + " | ".join(str(y) for y in all_years) + " |",
         "|---" + "|---:" * len(all_years) + "|",
     ]
@@ -3632,6 +3023,966 @@ async def _get_vn_macro_indicators(_args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text="\n".join(lines))]
 
 
+_M2_BANKS = ["VCB", "BID", "CTG", "TCB", "MBB"]
+
+
+async def _fetch_bank_loan_series(ticker: str, period: str = "year") -> dict[str, float]:
+    """Fetch loans_and_advances_to_customers_net for a VN bank. Returns {period_label: VND}."""
+    raw = await _vnstock_subprocess("balance_sheet", {"ticker": ticker, "period": period})
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(rows, list):
+        return {}
+    for row in rows:
+        if row.get("item_id") == "loans_and_advances_to_customers_net":
+            return {
+                k: float(v) for k, v in row.items()
+                if k not in ("item", "item_en", "item_id") and v is not None
+            }
+    return {}
+
+
+def _load_m2_series() -> list[dict]:
+    """Return user-entered monthly M2 observations sorted by date ascending."""
+    if not M2_SERIES_PATH.exists():
+        return []
+    try:
+        data = json.loads(M2_SERIES_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return []
+    except json.JSONDecodeError:
+        return []
+    return sorted(data, key=lambda x: x.get("date", ""))
+
+
+def _save_m2_series(rows: list[dict]) -> None:
+    M2_SERIES_PATH.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _m2_user_yoy(rows: list[dict]) -> tuple[float | None, str | None]:
+    """Compute YoY M2 growth from user-entered series. Only requires the latest month + a matching month 12 months prior."""
+    if not rows:
+        return None, None
+    latest = rows[-1]
+    latest_date = latest.get("date", "")
+    latest_val = float(latest.get("value_trillion_vnd") or latest.get("value") or 0)
+    if latest_val <= 0 or len(latest_date) < 7:
+        return None, latest_date or None
+    try:
+        y = int(latest_date[:4])
+        m = int(latest_date[5:7])
+        target_ym = f"{y - 1:04d}-{m:02d}"
+    except ValueError:
+        return None, latest_date
+    for r in rows:
+        if r.get("date", "").startswith(target_ym):
+            prior = float(r.get("value_trillion_vnd") or r.get("value") or 0)
+            if prior > 0:
+                return (latest_val / prior - 1) * 100, latest_date
+    return None, latest_date
+
+
+@register_tool(
+    name='get_money_supply',
+    description="Analyze Vietnam money supply (cung tiền M2) and credit conditions. Combines World Bank annual data (broad money growth %, M2/GDP ratio) with a fresher **credit growth proxy** aggregated from top 5 VN banks' quarterly loan books (VCB, BID, CTG, TCB, MBB) — quarterly YoY loan expansion is the tactical leading indicator since SBV monthly M2 has no free public API. Returns: excess liquidity gap (M2 growth − GDP growth), historical trend, bank credit growth vs 5-year average, and monetary condition verdict (LOOSE / NEUTRAL / TIGHT) with implication for VN equity.",
+    input_schema={'type': 'object', 'properties': {}, 'required': []},
+)
+async def _get_money_supply(_args: dict) -> list[types.TextContent]:
+    # ── 1. User-entered M2 series (Option A — highest priority tactical M2) ──
+    m2_user_rows = _load_m2_series()
+    m2_user_yoy, m2_user_latest_date = _m2_user_yoy(m2_user_rows)
+
+    # ── 2. Bank credit growth proxy (fresh, tactical) ────────────────────
+    annual_series, quarterly_series = await asyncio.gather(
+        asyncio.gather(*[_fetch_bank_loan_series(t, "year") for t in _M2_BANKS]),
+        asyncio.gather(*[_fetch_bank_loan_series(t, "quarter") for t in _M2_BANKS]),
+    )
+    bank_annual = dict(zip(_M2_BANKS, annual_series))
+    bank_quarterly = dict(zip(_M2_BANKS, quarterly_series))
+
+    def _aggregate(banks: dict[str, dict[str, float]]) -> list[tuple[str, float]]:
+        periods: set[str] = set()
+        for s in banks.values():
+            periods.update(s.keys())
+        agg: list[tuple[str, float]] = []
+        for p in sorted(periods, reverse=True):
+            total = sum(s.get(p, 0) for s in banks.values() if s.get(p))
+            if total > 0:
+                agg.append((p, total))
+        return agg
+
+    annual_agg = _aggregate(bank_annual)
+    quarterly_agg = _aggregate(bank_quarterly)
+
+    annual_yoy: list[tuple[str, float]] = []
+    for i in range(len(annual_agg) - 1):
+        curr_p, curr_v = annual_agg[i]
+        _, prior_v = annual_agg[i + 1]
+        if prior_v > 0:
+            annual_yoy.append((curr_p, (curr_v / prior_v - 1) * 100))
+
+    quarterly_yoy: tuple[str, float] | None = None
+    if len(quarterly_agg) >= 5:
+        curr_p, curr_v = quarterly_agg[0]
+        _, prior_v = quarterly_agg[4]
+        if prior_v > 0:
+            quarterly_yoy = (curr_p, (curr_v / prior_v - 1) * 100)
+
+    latest_credit_yoy: float | None = quarterly_yoy[1] if quarterly_yoy else (annual_yoy[0][1] if annual_yoy else None)
+    credit_avg_5y: float | None = None
+    if annual_yoy:
+        recent = annual_yoy[:5]
+        credit_avg_5y = sum(g for _, g in recent) / len(recent)
+
+    # ── 3. World Bank structural context (lagged, backdrop only) ─────────
+    wb_codes = {
+        "M2 growth (%)":          "FM.LBL.BMNY.ZG",
+        "M2 / GDP (%)":           "FM.LBL.BMNY.GD.ZS",
+        "GDP growth (%)":         "NY.GDP.MKTP.KD.ZG",
+    }
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        wb_results = await asyncio.gather(*[
+            _fetch_wb_indicator(client, label, code) for label, code in wb_codes.items()
+        ])
+    wb_series_map: dict[str, dict[int, float]] = {
+        label: dict(series) for label, series, _ in wb_results
+    }
+    wb_freshness_map: dict[str, str] = {label: fr for label, _, fr in wb_results}
+
+    m2_series = wb_series_map.get("M2 growth (%)", {})
+    m2_gdp = wb_series_map.get("M2 / GDP (%)", {})
+    gdp_series = wb_series_map.get("GDP growth (%)", {})
+
+    latest_m2_year = max(m2_series.keys()) if m2_series else None
+    latest_m2_wb = m2_series.get(latest_m2_year) if latest_m2_year else None
+    latest_gdp = gdp_series.get(latest_m2_year) if latest_m2_year else None
+    latest_m2_gdp = m2_gdp.get(latest_m2_year) if latest_m2_year else None
+
+    if m2_series:
+        m2_values = sorted(m2_series.items(), reverse=True)[:5]
+        avg_5y_wb = sum(v for _, v in m2_values) / len(m2_values)
+    else:
+        avg_5y_wb = None
+
+    excess_liquidity = (latest_m2_wb - latest_gdp) if latest_m2_wb and latest_gdp else None
+    wb_stale = any(f in ("stale", "unavailable") for f in wb_freshness_map.values())
+
+    # ── 4. Verdict — WEIGHT TACTICAL SIGNALS HIGHER (user M2 + bank credit) ──
+    score = 0
+    findings: list[str] = []
+
+    # User-entered M2 (highest weight when available)
+    if m2_user_yoy is not None:
+        if m2_user_yoy > 14:
+            score += 3; findings.append(f"User M2 growth {m2_user_yoy:+.2f}% YoY ({m2_user_latest_date}) — LOOSE (fresh, user-entered)")
+        elif m2_user_yoy < 8:
+            score -= 3; findings.append(f"User M2 growth {m2_user_yoy:+.2f}% YoY ({m2_user_latest_date}) — TIGHT (fresh, user-entered)")
+        else:
+            findings.append(f"User M2 growth {m2_user_yoy:+.2f}% YoY — neutral zone")
+
+    # Bank credit growth (high weight — fresh quarterly proxy)
+    if latest_credit_yoy is not None:
+        if latest_credit_yoy > 16:
+            score += 3; findings.append(f"Top-5 bank credit growth {latest_credit_yoy:+.1f}% YoY — aggressive expansion (leads M2 1-2 quarters)")
+        elif latest_credit_yoy > 12:
+            score += 1; findings.append(f"Top-5 bank credit growth {latest_credit_yoy:+.1f}% YoY — healthy expansion")
+        elif latest_credit_yoy < 8:
+            score -= 3; findings.append(f"Top-5 bank credit growth {latest_credit_yoy:+.1f}% YoY — weak expansion (bearish)")
+
+    if credit_avg_5y and latest_credit_yoy is not None:
+        delta = latest_credit_yoy - credit_avg_5y
+        if delta > 3:
+            score += 1; findings.append(f"Credit accelerating (+{delta:+.1f}pp vs 5-year avg {credit_avg_5y:.1f}%)")
+        elif delta < -3:
+            score -= 1; findings.append(f"Credit decelerating ({delta:+.1f}pp vs 5-year avg {credit_avg_5y:.1f}%)")
+
+    # WB M2 — LOW weight when it's stale (2+ years old)
+    if latest_m2_wb is not None and latest_m2_year and (2026 - latest_m2_year) <= 1:
+        # Fresh WB data — weight normally
+        if latest_m2_wb > 15:
+            score += 2; findings.append(f"WB M2 growth {latest_m2_wb:.1f}% ({latest_m2_year}) — supportive structural")
+        elif latest_m2_wb < 8:
+            score -= 2; findings.append(f"WB M2 growth {latest_m2_wb:.1f}% ({latest_m2_year}) — restrictive structural")
+    elif latest_m2_wb is not None:
+        # Stale WB data — advisory only, ½ weight
+        if latest_m2_wb > 15:
+            score += 1; findings.append(f"WB M2 growth {latest_m2_wb:.1f}% ({latest_m2_year}) — stale, advisory only")
+        elif latest_m2_wb < 8:
+            score -= 1; findings.append(f"WB M2 growth {latest_m2_wb:.1f}% ({latest_m2_year}) — stale, advisory only")
+
+    # Divergence: user M2 + bank credit disagreeing = signal
+    if m2_user_yoy is not None and latest_credit_yoy is not None:
+        divergence = abs(m2_user_yoy - latest_credit_yoy)
+        if divergence > 6:
+            if latest_credit_yoy > m2_user_yoy:
+                findings.append(
+                    f"⚠️ Divergence: bank credit ({latest_credit_yoy:+.1f}%) > user M2 ({m2_user_yoy:+.1f}%) "
+                    f"by {divergence:.1f}pp — possible shadow banking or corporate bond stress"
+                )
+            else:
+                findings.append(
+                    f"⚠️ Divergence: user M2 ({m2_user_yoy:+.1f}%) > bank credit ({latest_credit_yoy:+.1f}%) "
+                    f"by {divergence:.1f}pp — deposits growing faster than lending (banks hoarding liquidity)"
+                )
+
+    if score >= 5: verdict = "🟢 LOOSE — supportive for equity, watch for late-cycle excess"
+    elif score >= 2: verdict = "🟢 MILD LOOSE — accommodative"
+    elif score <= -5: verdict = "🔴 TIGHT — equity headwind, defensive positioning"
+    elif score <= -2: verdict = "🟠 MILD TIGHT — cautious"
+    else: verdict = "⚪ NEUTRAL"
+
+    # ── 5. Render — tactical first, structural as backdrop ────────────────
+    lines = [
+        "## Vietnam Money Supply & Credit Conditions",
+        f"**Verdict: {verdict}** (score {score:+d})",
+        "",
+        "> **Signal hierarchy** (freshest → most lagged):",
+        "> 1. **User-entered monthly M2** (from TradingView / SBV / GSO — enter via `manage_m2_series`)",
+        "> 2. **Top-5 bank credit growth** (vnstock quarterly — freshest institutional proxy, leads M2 by 1-2Q)",
+        "> 3. **World Bank M2 annual** (structural context, typically 2-3 year lag)",
+    ]
+
+    # ── User M2 section (highest priority) ────────────────────────────────
+    lines += ["", "### 1️⃣ User M2 Series (fresh monthly, if available)"]
+    if m2_user_rows:
+        lines.append(f"*{len(m2_user_rows)} observations from `.m2_series.json` — latest: {m2_user_rows[-1].get('date', '?')}*")
+        lines.append("")
+        lines.append("| Month | Value (T VND) | Source | Note |")
+        lines.append("|---|---:|---|---|")
+        for r in m2_user_rows[-6:]:
+            date = r.get("date", "")
+            val = r.get("value_trillion_vnd") or r.get("value", 0)
+            src = (r.get("source") or "")[:30]
+            note = (r.get("note") or "")[:40]
+            lines.append(f"| {date} | {val:,.0f} | {src} | {note} |")
+        if m2_user_yoy is not None:
+            direction = "🟢 LOOSE" if m2_user_yoy > 14 else "🔴 TIGHT" if m2_user_yoy < 8 else "⚪ neutral"
+            lines.append(f"\n**Latest YoY: {m2_user_yoy:+.2f}%** ({direction})")
+        else:
+            lines.append(f"\n*No same-month observation from 12 months ago — add a {int(m2_user_rows[-1].get('date', '2026')[:4]) - 1}-XX entry to enable YoY (have {len(m2_user_rows)} obs).*")
+    else:
+        lines.append(
+            "*No user M2 data yet. Add monthly values from TradingView (ECONOMICS:VNM2) or SBV/GSO "
+            "via `manage_m2_series(action='add', date='2026-05', value_trillion_vnd=15200)` — fresher than WB.*"
+        )
+
+    # ── Bank credit growth (main tactical signal) ─────────────────────────
+    lines += [
+        "",
+        "### 2️⃣ Top-5 Bank Credit Growth (fresh tactical proxy)",
+        f"*Aggregate `loans_and_advances_to_customers_net` for {', '.join(_M2_BANKS)}. "
+        f"Credit leads M2 by 1-2 quarters in VN — this is the actionable signal.*",
+        "",
+    ]
+    if annual_yoy:
+        lines.append("**Annual (audited):**")
+        lines.append("")
+        lines.append("| Year | Aggregate loans (T VND) | YoY growth |")
+        lines.append("|---|---:|---:|")
+        annual_yoy_map = dict(annual_yoy)
+        for p, total in annual_agg[:6]:
+            g = annual_yoy_map.get(p)
+            g_str = f"{g:+.2f}%" if g is not None else "—"
+            lines.append(f"| {p} | {total/1e12:,.0f} | {g_str} |")
+        if credit_avg_5y is not None:
+            lines.append(f"\n*Trailing 5-year avg: {credit_avg_5y:.2f}% YoY.*")
+    else:
+        lines.append("*Annual bank data unavailable.*")
+
+    if quarterly_agg:
+        lines += ["", "**Quarterly (latest, unaudited):**", ""]
+        lines.append("| Quarter | Aggregate loans (T VND) | YoY vs same Q last year |")
+        lines.append("|---|---:|---:|")
+        for i, (p, total) in enumerate(quarterly_agg[:4]):
+            g_str = "—"
+            if i + 4 < len(quarterly_agg):
+                prior_v = quarterly_agg[i + 4][1]
+                if prior_v > 0:
+                    g_str = f"{(total / prior_v - 1) * 100:+.2f}%"
+            lines.append(f"| {p} | {total/1e12:,.0f} | {g_str} |")
+        if quarterly_yoy:
+            lines.append(f"\n*Latest quarterly YoY: **{quarterly_yoy[1]:+.2f}%** ({quarterly_yoy[0]}) — freshest reading.*")
+        else:
+            lines.append(f"\n*Only {len(quarterly_agg)} quarters — need 5+ for quarterly YoY.*")
+
+    # ── WB structural context (backdrop) ──────────────────────────────────
+    lines += ["", "### 3️⃣ World Bank Structural Context (annual, lagged)"]
+    if wb_stale:
+        stale_labels = [l for l, f in wb_freshness_map.items() if f in ("stale", "unavailable")]
+        lines.append(f"> ⚠️ **WB API partially unavailable** — served from cache where possible ({', '.join(stale_labels)}).")
+    if latest_m2_wb is None and not m2_series:
+        lines.append("*World Bank data unavailable — tactical signals above are still reliable.*")
+    else:
+        lines.append("| Metric | Latest | 5-yr avg |")
+        lines.append("|---|---:|---:|")
+        if latest_m2_wb is not None:
+            avg_str = f"{avg_5y_wb:.2f}%" if avg_5y_wb else "—"
+            lines.append(f"| M2 broad money growth | {latest_m2_wb:.2f}% ({latest_m2_year}) | {avg_str} |")
+        if latest_m2_gdp is not None:
+            lines.append(f"| M2 / GDP ratio | {latest_m2_gdp:.1f}% ({latest_m2_year}) | — |")
+        if latest_gdp is not None:
+            lines.append(f"| GDP growth | {latest_gdp:.2f}% ({latest_m2_year}) | — |")
+        if excess_liquidity is not None:
+            lines.append(f"| Excess liquidity gap (M2 − GDP) | {excess_liquidity:+.2f}pp | — |")
+
+        if m2_series:
+            lines += ["", "**M2 growth history (WB annual):**", ""]
+            lines.append("| Year | M2 growth | GDP growth | Gap |")
+            lines.append("|---|---:|---:|---:|")
+            for yr in sorted(m2_series.keys(), reverse=True)[:6]:
+                m2v = m2_series.get(yr)
+                gdpv = gdp_series.get(yr)
+                gap = (m2v - gdpv) if m2v is not None and gdpv is not None else None
+                lines.append(
+                    f"| {yr} | {m2v:.2f}% | {gdpv:.2f}% | {gap:+.2f}pp |" if gap is not None
+                    else f"| {yr} | {m2v or '—'} | {gdpv or '—'} | — |"
+                )
+
+    lines += ["", "### Findings"]
+    lines += [f"- {f}" for f in findings] if findings else ["- *Insufficient data for signals.*"]
+
+    lines += [
+        "",
+        "### How to read",
+        "- **Bank credit growth** is the primary VN monetary signal — credit expansion → M2 growth → asset prices. Watch for YoY > 14% (aggressive) or < 8% (tight).",
+        "- **User M2 series** (if entered) gives monthly resolution and confirms bank credit's direction. Enter latest reading from TradingView ECONOMICS:VNM2, SBV, or GSO.",
+        "- **WB M2 annual** is structural backdrop only — 2-3 year lag makes it useless for tactical decisions.",
+        "- **Divergence** between user M2 and bank credit flags shadow banking or unusual bank behavior.",
+        "- Combine with `get_vn_macro_indicators` (CPI, real rates) for full monetary picture.",
+    ]
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+@register_tool(
+    name='manage_m2_series',
+    description='Manage user-entered monthly M2 broad money series in `.m2_series.json`. VN monthly M2 has no free public API — user enters values from TradingView (ECONOMICS:VNM2), SBV, or GSO publications. Used by `get_money_supply` as the freshest structural signal (higher priority than lagged WB annual data). Actions: `list`, `add` (upsert by month), `remove` (by month), `clear`.',
+    input_schema={'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['list', 'add', 'remove', 'clear']}, 'date': {'type': 'string', 'description': "Month in YYYY-MM (e.g. '2026-05'). Required for add/remove."}, 'value_trillion_vnd': {'type': 'number', 'description': 'M2 value in trillions VND (e.g. 15200 for 15.2 quadrillion / 15,200 trillion).'}, 'source': {'type': 'string', 'description': "Data source label (e.g. 'TradingView ECONOMICS:VNM2', 'SBV monthly stats')."}, 'note': {'type': 'string', 'description': 'Optional context (revision flag, methodology note, etc.).'}}, 'required': ['action']},
+)
+async def _manage_m2_series(args: dict) -> list[types.TextContent]:
+    action = str(args.get("action", "")).lower().strip()
+    rows = _load_m2_series()
+
+    if action == "list":
+        if not rows:
+            return [types.TextContent(
+                type="text",
+                text=(
+                    "No M2 observations yet. Add via:\n"
+                    "`manage_m2_series(action='add', date='2026-05', value_trillion_vnd=15200, source='TradingView ECONOMICS:VNM2')`\n\n"
+                    "Data sources:\n"
+                    "- TradingView: https://vn.tradingview.com/symbols/ECONOMICS-VNM2/\n"
+                    "- SBV: https://sbv.gov.vn (monthly monetary statistics)\n"
+                    "- GSO: https://www.gso.gov.vn"
+                )
+            )]
+        lines = [f"## User M2 Series ({len(rows)} observations)", "", "| Date | Value (T VND) | Source | Note |", "|---|---:|---|---|"]
+        for r in rows:
+            date = r.get("date", "")
+            val = r.get("value_trillion_vnd") or r.get("value", 0)
+            src = (r.get("source") or "")[:40]
+            note = (r.get("note") or "")[:60]
+            lines.append(f"| {date} | {float(val):,.0f} | {src} | {note} |")
+        yoy, latest_date = _m2_user_yoy(rows)
+        if yoy is not None:
+            lines += ["", f"**Latest YoY growth ({latest_date}): {yoy:+.2f}%**"]
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    if action == "clear":
+        _save_m2_series([])
+        return [types.TextContent(type="text", text="M2 series cleared.")]
+
+    date = str(args.get("date", "")).strip()
+    if not date or len(date) < 7:
+        return [types.TextContent(type="text", text="`date` in YYYY-MM format is required.")]
+
+    if action == "remove":
+        before = len(rows)
+        rows = [r for r in rows if not r.get("date", "").startswith(date[:7])]
+        if len(rows) == before:
+            return [types.TextContent(type="text", text=f"No observation matches month {date[:7]}.")]
+        _save_m2_series(rows)
+        return [types.TextContent(type="text", text=f"Removed {date[:7]}. {len(rows)} observations remaining.")]
+
+    if action == "add":
+        val = args.get("value_trillion_vnd") or args.get("value")
+        if val is None:
+            return [types.TextContent(type="text", text="`value_trillion_vnd` is required for add.")]
+        try:
+            val_f = float(val)
+        except (TypeError, ValueError):
+            return [types.TextContent(type="text", text=f"Invalid value: {val}")]
+        entry = {
+            "date": date[:7],  # normalize to YYYY-MM
+            "value_trillion_vnd": val_f,
+            "source": str(args.get("source", "")).strip() or "manual entry",
+            "note": str(args.get("note", "")).strip(),
+        }
+        # Replace existing month, else append
+        rows = [r for r in rows if not r.get("date", "").startswith(date[:7])]
+        rows.append(entry)
+        rows.sort(key=lambda x: x.get("date", ""))
+        _save_m2_series(rows)
+        return [types.TextContent(
+            type="text",
+            text=f"Added M2 for {date[:7]}: {val_f:,.0f}T VND. {len(rows)} observations total."
+        )]
+
+    return [types.TextContent(type="text", text=f"Unknown action: {action}. Use list/add/remove/clear.")]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Macro pillars: CPI + Interest rate + FX
+# Mirrors the manage_m2_series pattern for indicators without a free public API.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_cpi_series() -> list[dict]:
+    if not CPI_SERIES_PATH.exists():
+        return []
+    try:
+        data = json.loads(CPI_SERIES_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return sorted(data, key=lambda x: x.get("date", ""))
+
+
+def _save_cpi_series(rows: list[dict]) -> None:
+    CPI_SERIES_PATH.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _cpi_momentum(rows: list[dict]) -> dict:
+    """Latest CPI YoY + 3-month momentum (avg of last 3 minus avg of prior 3)."""
+    if not rows:
+        return {"latest": None, "latest_date": None, "trend_3m": None}
+    latest = rows[-1]
+    latest_val = latest.get("cpi_yoy")
+    try:
+        latest_val = float(latest_val) if latest_val is not None else None
+    except (TypeError, ValueError):
+        latest_val = None
+    trend = None
+    if len(rows) >= 6:
+        recent = [float(r["cpi_yoy"]) for r in rows[-3:] if r.get("cpi_yoy") is not None]
+        prior = [float(r["cpi_yoy"]) for r in rows[-6:-3] if r.get("cpi_yoy") is not None]
+        if len(recent) == 3 and len(prior) == 3:
+            trend = sum(recent) / 3 - sum(prior) / 3
+    return {"latest": latest_val, "latest_date": latest.get("date"), "trend_3m": trend}
+
+
+def _load_rate_series() -> list[dict]:
+    if not RATE_SERIES_PATH.exists():
+        return []
+    try:
+        data = json.loads(RATE_SERIES_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return sorted(data, key=lambda x: x.get("date", ""))
+
+
+def _save_rate_series(rows: list[dict]) -> None:
+    RATE_SERIES_PATH.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _rate_latest(rows: list[dict]) -> dict:
+    if not rows:
+        return {"date": None, "refinance": None, "interbank_on": None, "deposit_12m": None, "prior_refinance": None}
+    latest = rows[-1]
+
+    def _f(key: str, source: dict) -> float | None:
+        v = source.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    prior_refi = _f("refinance", rows[-2]) if len(rows) >= 2 else None
+    return {
+        "date": latest.get("date"),
+        "refinance": _f("refinance", latest),
+        "interbank_on": _f("interbank_on", latest),
+        "deposit_12m": _f("deposit_12m", latest),
+        "prior_refinance": prior_refi,
+    }
+
+
+async def _fetch_vcb_usd_vnd() -> tuple[float | None, str | None]:
+    """Fetch USD/VND sell rate from Vietcombank XML. Returns (rate, timestamp) or (None, error)."""
+    import xml.etree.ElementTree as ET
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as c:
+            resp = await c.get(_VCB_FX_URL, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception as e:
+        return None, f"fetch failed: {e}"
+
+    for node in root.findall("Exrate"):
+        if node.get("CurrencyCode", "").strip() == "USD":
+            sell = node.get("Sell", "").replace(",", "")
+            try:
+                return float(sell), root.findtext("DateTime")
+            except ValueError:
+                return None, "parse failed"
+    return None, "USD not in feed"
+
+
+def _load_fx_history() -> list[dict]:
+    if not FX_HISTORY_PATH.exists():
+        return []
+    try:
+        data = json.loads(FX_HISTORY_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return sorted(data, key=lambda x: x.get("date", ""))
+
+
+def _append_fx_snapshot(usd_vnd: float) -> list[dict]:
+    """Append today's USD/VND snapshot (dedupe by date). Returns full history."""
+    from datetime import date as _date
+    rows = _load_fx_history()
+    today = _date.today().isoformat()
+    rows = [r for r in rows if r.get("date") != today]
+    rows.append({"date": today, "usd_vnd": usd_vnd, "source": "Vietcombank sell"})
+    rows.sort(key=lambda x: x.get("date", ""))
+    FX_HISTORY_PATH.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+    return rows
+
+
+def _fx_change_pct(rows: list[dict], lookback_days: int) -> float | None:
+    """Return % change vs snapshot ~lookback_days ago (nearest older)."""
+    if len(rows) < 2:
+        return None
+    from datetime import date as _date, timedelta
+    target = (_date.today() - timedelta(days=lookback_days)).isoformat()
+    latest = rows[-1]
+    latest_val = latest.get("usd_vnd")
+    if not latest_val:
+        return None
+    baseline = None
+    for r in rows[:-1]:
+        if r.get("date", "") <= target:
+            baseline = r
+    if baseline is None:
+        baseline = rows[0]
+    base_val = baseline.get("usd_vnd")
+    if not base_val:
+        return None
+    return (float(latest_val) / float(base_val) - 1) * 100
+
+
+@register_tool(
+    name='manage_cpi_series',
+    description="Manage user-entered monthly CPI (lạm phát) series in `.cpi_series.json`. Vietnam CPI has no free realtime API — enter monthly YoY figures from GSO (Tổng cục Thống kê) or TradingView `ECONOMICS:VNCPIYY`. Used by `get_macro_pillars` as the freshest inflation signal. Actions: `list`, `add` (upsert by month), `remove` (by month), `clear`.",
+    input_schema={'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['list', 'add', 'remove', 'clear']}, 'date': {'type': 'string', 'description': "Month in YYYY-MM (e.g. '2026-07'). Required for add/remove."}, 'cpi_yoy': {'type': 'number', 'description': 'CPI year-over-year change in percent (e.g. 3.4 for 3.4%).'}, 'cpi_mom': {'type': 'number', 'description': 'Optional month-over-month CPI change in percent.'}, 'source': {'type': 'string', 'description': "Data source label (e.g. 'GSO monthly release', 'TradingView ECONOMICS:VNCPIYY')."}, 'note': {'type': 'string', 'description': 'Optional context.'}}, 'required': ['action']},
+)
+async def _manage_cpi_series(args: dict) -> list[types.TextContent]:
+    action = str(args.get("action", "")).lower().strip()
+    rows = _load_cpi_series()
+
+    if action == "list":
+        if not rows:
+            return [types.TextContent(
+                type="text",
+                text=(
+                    "No CPI observations yet. Add via:\n"
+                    "`manage_cpi_series(action='add', date='2026-07', cpi_yoy=3.4, source='GSO')`\n\n"
+                    "Data sources:\n"
+                    "- GSO monthly: https://www.gso.gov.vn/tin-tuc-thong-ke/\n"
+                    "- TradingView: https://vn.tradingview.com/symbols/ECONOMICS-VNCPIYY/\n"
+                    "- SBV inflation monitoring: https://sbv.gov.vn"
+                )
+            )]
+        lines = [f"## User CPI Series ({len(rows)} observations)", "", "| Date | YoY % | MoM % | Source | Note |", "|---|---:|---:|---|---|"]
+        for r in rows:
+            yoy = r.get("cpi_yoy")
+            mom = r.get("cpi_mom")
+            yoy_s = f"{float(yoy):+.2f}" if yoy is not None else "-"
+            mom_s = f"{float(mom):+.2f}" if mom is not None else "-"
+            src = (r.get("source") or "")[:40]
+            note = (r.get("note") or "")[:60]
+            lines.append(f"| {r.get('date','')} | {yoy_s} | {mom_s} | {src} | {note} |")
+        mom_info = _cpi_momentum(rows)
+        if mom_info["latest"] is not None:
+            trend = mom_info["trend_3m"]
+            trend_s = f", 3M trend {trend:+.2f}pp" if trend is not None else ""
+            lines += ["", f"**Latest ({mom_info['latest_date']}): {mom_info['latest']:+.2f}% YoY{trend_s}**"]
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    if action == "clear":
+        _save_cpi_series([])
+        return [types.TextContent(type="text", text="CPI series cleared.")]
+
+    date = str(args.get("date", "")).strip()
+    if not date or len(date) < 7:
+        return [types.TextContent(type="text", text="`date` in YYYY-MM format is required.")]
+    ym = date[:7]
+
+    if action == "remove":
+        before = len(rows)
+        rows = [r for r in rows if not r.get("date", "").startswith(ym)]
+        if len(rows) == before:
+            return [types.TextContent(type="text", text=f"No observation matches month {ym}.")]
+        _save_cpi_series(rows)
+        return [types.TextContent(type="text", text=f"Removed {ym}. {len(rows)} observations remaining.")]
+
+    if action == "add":
+        yoy = args.get("cpi_yoy")
+        if yoy is None:
+            return [types.TextContent(type="text", text="`cpi_yoy` is required for add.")]
+        try:
+            yoy_f = float(yoy)
+        except (TypeError, ValueError):
+            return [types.TextContent(type="text", text=f"Invalid cpi_yoy: {yoy}")]
+        mom = args.get("cpi_mom")
+        try:
+            mom_f = float(mom) if mom is not None else None
+        except (TypeError, ValueError):
+            mom_f = None
+        entry = {
+            "date": ym,
+            "cpi_yoy": yoy_f,
+            "cpi_mom": mom_f,
+            "source": str(args.get("source", "")).strip() or "manual entry",
+            "note": str(args.get("note", "")).strip(),
+        }
+        rows = [r for r in rows if not r.get("date", "").startswith(ym)]
+        rows.append(entry)
+        rows.sort(key=lambda x: x.get("date", ""))
+        _save_cpi_series(rows)
+        return [types.TextContent(
+            type="text",
+            text=f"Added CPI for {ym}: {yoy_f:+.2f}% YoY. {len(rows)} observations total."
+        )]
+
+    return [types.TextContent(type="text", text=f"Unknown action: {action}. Use list/add/remove/clear.")]
+
+
+@register_tool(
+    name='manage_rate_series',
+    description="Manage user-entered interest rate series in `.rate_series.json` — SBV refinance rate, interbank overnight, and 12-month deposit rate. VN interest rate data has no consolidated free API — enter values from SBV (https://sbv.gov.vn), TradingView `ECONOMICS:VNINTR`, or bank websites. Used by `get_macro_pillars` alongside CPI to compute real rates and monetary stance. Actions: `list`, `add` (upsert by month), `remove` (by month), `clear`.",
+    input_schema={'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['list', 'add', 'remove', 'clear']}, 'date': {'type': 'string', 'description': "Month in YYYY-MM (e.g. '2026-07'). Required for add/remove."}, 'refinance': {'type': 'number', 'description': 'SBV refinance rate in percent (e.g. 4.5 for 4.5%). Primary policy rate.'}, 'interbank_on': {'type': 'number', 'description': 'Optional overnight interbank rate (VNIBOR ON) in percent — reveals system liquidity.'}, 'deposit_12m': {'type': 'number', 'description': 'Optional average 12-month deposit rate at large banks in percent — funding cost proxy.'}, 'source': {'type': 'string', 'description': "Data source label (e.g. 'SBV', 'VCB 12M deposit board rate')."}, 'note': {'type': 'string', 'description': 'Optional context (e.g. rate cut/hike decision reference).'}}, 'required': ['action']},
+)
+async def _manage_rate_series(args: dict) -> list[types.TextContent]:
+    action = str(args.get("action", "")).lower().strip()
+    rows = _load_rate_series()
+
+    if action == "list":
+        if not rows:
+            return [types.TextContent(
+                type="text",
+                text=(
+                    "No rate observations yet. Add via:\n"
+                    "`manage_rate_series(action='add', date='2026-07', refinance=4.5, interbank_on=3.2, source='SBV')`\n\n"
+                    "Data sources:\n"
+                    "- SBV policy rates: https://sbv.gov.vn/webcenter/portal/en/home/rm/ir\n"
+                    "- TradingView refinance: https://vn.tradingview.com/symbols/ECONOMICS-VNINTR/\n"
+                    "- Interbank rate (VNIBOR): SBV daily bulletin\n"
+                    "- Deposit rate: VCB/BID/TCB rate boards"
+                )
+            )]
+        lines = [f"## User Rate Series ({len(rows)} observations)", "", "| Date | Refinance % | Interbank ON % | Deposit 12M % | Source | Note |", "|---|---:|---:|---:|---|---|"]
+        for r in rows:
+            def _s(k: str) -> str:
+                v = r.get(k)
+                try:
+                    return f"{float(v):.2f}" if v is not None else "-"
+                except (TypeError, ValueError):
+                    return "-"
+            src = (r.get("source") or "")[:30]
+            note = (r.get("note") or "")[:40]
+            lines.append(f"| {r.get('date','')} | {_s('refinance')} | {_s('interbank_on')} | {_s('deposit_12m')} | {src} | {note} |")
+        latest = _rate_latest(rows)
+        if latest["refinance"] is not None:
+            delta = ""
+            if latest["prior_refinance"] is not None:
+                d = latest["refinance"] - latest["prior_refinance"]
+                delta = f" (Δ {d:+.2f}pp vs prior)"
+            lines += ["", f"**Latest ({latest['date']}) refinance: {latest['refinance']:.2f}%{delta}**"]
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    if action == "clear":
+        _save_rate_series([])
+        return [types.TextContent(type="text", text="Rate series cleared.")]
+
+    date = str(args.get("date", "")).strip()
+    if not date or len(date) < 7:
+        return [types.TextContent(type="text", text="`date` in YYYY-MM format is required.")]
+    ym = date[:7]
+
+    if action == "remove":
+        before = len(rows)
+        rows = [r for r in rows if not r.get("date", "").startswith(ym)]
+        if len(rows) == before:
+            return [types.TextContent(type="text", text=f"No observation matches month {ym}.")]
+        _save_rate_series(rows)
+        return [types.TextContent(type="text", text=f"Removed {ym}. {len(rows)} observations remaining.")]
+
+    if action == "add":
+        refi = args.get("refinance")
+        if refi is None:
+            return [types.TextContent(type="text", text="`refinance` is required for add.")]
+
+        def _num(v):
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        refi_f = _num(refi)
+        if refi_f is None:
+            return [types.TextContent(type="text", text=f"Invalid refinance: {refi}")]
+        entry = {
+            "date": ym,
+            "refinance": refi_f,
+            "interbank_on": _num(args.get("interbank_on")),
+            "deposit_12m": _num(args.get("deposit_12m")),
+            "source": str(args.get("source", "")).strip() or "manual entry",
+            "note": str(args.get("note", "")).strip(),
+        }
+        rows = [r for r in rows if not r.get("date", "").startswith(ym)]
+        rows.append(entry)
+        rows.sort(key=lambda x: x.get("date", ""))
+        _save_rate_series(rows)
+        return [types.TextContent(
+            type="text",
+            text=f"Added rate for {ym}: refinance {refi_f:.2f}%. {len(rows)} observations total."
+        )]
+
+    return [types.TextContent(type="text", text=f"Unknown action: {action}. Use list/add/remove/clear.")]
+
+
+def _classify_cpi(cpi_yoy: float | None, trend_3m: float | None) -> tuple[str, str]:
+    if cpi_yoy is None:
+        return "UNKNOWN", "No CPI series — call `manage_cpi_series(action='add', ...)` first."
+    if cpi_yoy >= 4.5:
+        v = "OVERHEATING"
+    elif cpi_yoy >= 4.0:
+        v = "RISING"
+    elif cpi_yoy >= 2.0:
+        v = "BENIGN"
+    else:
+        v = "DISINFLATION"
+    trend_note = ""
+    if trend_3m is not None:
+        if trend_3m >= 0.3:
+            trend_note = f" (accelerating, +{trend_3m:.2f}pp over 3M)"
+        elif trend_3m <= -0.3:
+            trend_note = f" (cooling, {trend_3m:.2f}pp over 3M)"
+        else:
+            trend_note = f" (stable, {trend_3m:+.2f}pp over 3M)"
+    return v, f"CPI {cpi_yoy:+.2f}% YoY{trend_note}"
+
+
+def _classify_fx(change_30d: float | None, change_7d: float | None) -> tuple[str, str]:
+    if change_30d is None and change_7d is None:
+        return "UNKNOWN", "No FX history yet — first `get_macro_pillars` call establishes baseline."
+    d30 = change_30d if change_30d is not None else 0
+    if abs(d30) >= 3.0:
+        v = "STRESS"
+    elif abs(d30) >= 1.0:
+        v = "PRESSURED"
+    else:
+        v = "STABLE"
+    parts = []
+    if change_7d is not None:
+        parts.append(f"7D {change_7d:+.2f}%")
+    if change_30d is not None:
+        parts.append(f"30D {change_30d:+.2f}%")
+    return v, "USD/VND " + ", ".join(parts)
+
+
+def _classify_rate(refinance: float | None, cpi_yoy: float | None, prior_refi: float | None) -> tuple[str, str, float | None]:
+    if refinance is None:
+        return "UNKNOWN", "No rate series — call `manage_rate_series(action='add', ...)` first.", None
+    if refinance >= 5.5:
+        v = "RESTRICTIVE"
+    elif refinance >= 4.0:
+        v = "NEUTRAL"
+    else:
+        v = "ACCOMMODATIVE"
+    real_rate = refinance - cpi_yoy if cpi_yoy is not None else None
+    move_note = ""
+    if prior_refi is not None:
+        d = refinance - prior_refi
+        if abs(d) >= 0.05:
+            move_note = f", Δ {d:+.2f}pp vs prior"
+    real_note = f", real rate {real_rate:+.2f}%" if real_rate is not None else ""
+    return v, f"Refinance {refinance:.2f}%{move_note}{real_note}", real_rate
+
+
+def _combine_regime(cpi_v: str, fx_v: str, rate_v: str, real_rate: float | None) -> tuple[str, str, list[str]]:
+    """Classify into 4 regimes and return (name, description, positioning bullets)."""
+    if "UNKNOWN" in {cpi_v, rate_v}:
+        return (
+            "INCOMPLETE",
+            "Missing CPI or rate data — cannot classify regime.",
+            ["Add CPI + rate observations via `manage_cpi_series` and `manage_rate_series`."]
+        )
+    hot_cpi = cpi_v in {"RISING", "OVERHEATING"}
+    fx_stress = fx_v in {"PRESSURED", "STRESS"}
+    tight_rate = rate_v == "RESTRICTIVE"
+    loose_rate = rate_v == "ACCOMMODATIVE"
+    negative_real = real_rate is not None and real_rate < 0
+
+    if cpi_v == "OVERHEATING" and fx_stress:
+        return (
+            "STAGFLATION RISK",
+            "CPI overheating + FX under stress — SBV pressured to hike; equity multiples compress.",
+            [
+                "UNDERWEIGHT growth/tech; long-duration cash flows discounted harder",
+                "UNDERWEIGHT USD-debt names (HVN, aviation, power)",
+                "OVERWEIGHT exporters with natural USD hedge (FPT services, DGC, TCM, VHC)",
+                "Raise cash allocation; tighten stop-losses",
+            ]
+        )
+    if hot_cpi and loose_rate and negative_real:
+        return (
+            "REFLATION",
+            "CPI rising while rates still accommodative — negative real rates fuel risk assets, but a policy pivot is the tail risk.",
+            [
+                "OVERWEIGHT banks (NIM expansion), commodities, cyclicals",
+                "OVERWEIGHT real estate (leveraged to loose credit)",
+                "MONITOR: gap between CPI and refinance — if it widens further, SBV must act",
+                "Prepare rotation plan for a rate-hike surprise",
+            ]
+        )
+    if cpi_v == "BENIGN" and not fx_stress and (loose_rate or rate_v == "NEUTRAL"):
+        return (
+            "GOLDILOCKS",
+            "Low inflation + stable FX + non-restrictive policy — the ideal window for equity risk-on.",
+            [
+                "OVERWEIGHT growth (FPT, MWG, tech), midcaps",
+                "OVERWEIGHT banks (credit growth without margin squeeze)",
+                "NEUTRAL commodities (no reflation tailwind)",
+                "Deploy cash reserves; loosen stop-losses within risk budget",
+            ]
+        )
+    if tight_rate and cpi_v in {"BENIGN", "DISINFLATION"}:
+        return (
+            "TIGHT / DISINFLATION",
+            "Restrictive rates + cooling CPI — policy easing on the horizon; front-run the pivot with quality.",
+            [
+                "OVERWEIGHT quality compounders (durable FCF weathers high rates)",
+                "OVERWEIGHT long-duration bonds; equities that benefit from rate cuts (banks, REITs)",
+                "UNDERWEIGHT deep cyclicals until easing confirmed",
+                "Build watchlist of oversold quality for pivot entry",
+            ]
+        )
+    if cpi_v == "DISINFLATION" and rate_v != "RESTRICTIVE":
+        return (
+            "DEFLATION RISK",
+            "Falling CPI with policy already loose — demand weakness, not benign disinflation.",
+            [
+                "OVERWEIGHT consumer staples, utilities (defensive)",
+                "UNDERWEIGHT banks (NIM compression + credit losses)",
+                "UNDERWEIGHT commodities, cyclicals",
+                "Cash-preservation mode",
+            ]
+        )
+    return (
+        "MIXED",
+        f"Signals not aligned: CPI {cpi_v}, FX {fx_v}, Rate {rate_v}. No clear regime — trade with caution.",
+        [
+            "Reduce position sizing until signals converge",
+            "Focus on stock-specific catalysts over macro beta",
+        ]
+    )
+
+
+@register_tool(
+    name='get_macro_pillars',
+    description="Unified analysis of the three VN macro pillars — **CPI (lạm phát), USD/VND (tỷ giá), and interest rates (lãi suất)** — with a regime verdict (Goldilocks / Reflation / Stagflation risk / Tight / Deflation risk) and sector positioning. Pulls: (1) user-entered CPI from `.cpi_series.json` via `manage_cpi_series`, (2) live USD/VND from Vietcombank plus 7D/30D delta from `.fx_history.json` (auto-appended on each call), (3) user-entered rates from `.rate_series.json` via `manage_rate_series`. Computes real interest rate = refinance − CPI YoY. Call at the start of any top-down analysis or when reassessing portfolio positioning.",
+    input_schema={'type': 'object', 'properties': {}, 'required': []},
+)
+async def _get_macro_pillars(_args: dict) -> list[types.TextContent]:
+    cpi_rows = _load_cpi_series()
+    rate_rows = _load_rate_series()
+    cpi_info = _cpi_momentum(cpi_rows)
+    rate_info = _rate_latest(rate_rows)
+
+    usd_vnd, fx_ts = await _fetch_vcb_usd_vnd()
+    fx_rows: list[dict] = []
+    change_7d: float | None = None
+    change_30d: float | None = None
+    if usd_vnd is not None:
+        fx_rows = _append_fx_snapshot(usd_vnd)
+        change_7d = _fx_change_pct(fx_rows, 7)
+        change_30d = _fx_change_pct(fx_rows, 30)
+
+    cpi_verdict, cpi_desc = _classify_cpi(cpi_info["latest"], cpi_info["trend_3m"])
+    fx_verdict, fx_desc = _classify_fx(change_30d, change_7d)
+    rate_verdict, rate_desc, real_rate = _classify_rate(
+        rate_info["refinance"], cpi_info["latest"], rate_info["prior_refinance"]
+    )
+    regime, regime_desc, positioning = _combine_regime(cpi_verdict, fx_verdict, rate_verdict, real_rate)
+
+    lines = [
+        "# Ba trụ cột vĩ mô Việt Nam",
+        "",
+        "## 1️⃣ Lạm phát (CPI)",
+        f"- Verdict: **{cpi_verdict}**",
+        f"- {cpi_desc}",
+        f"- Latest observation: {cpi_info['latest_date'] or 'none'}",
+        f"- Threshold: mục tiêu Quốc hội ≤4.5% YoY",
+        "",
+        "## 2️⃣ Tỷ giá (USD/VND)",
+        f"- Verdict: **{fx_verdict}**",
+        f"- {fx_desc}",
+    ]
+    if usd_vnd is not None:
+        lines.append(f"- Spot: {usd_vnd:,.0f} VND/USD (Vietcombank sell, {fx_ts or 'now'})")
+        lines.append(f"- History: {len(fx_rows)} daily snapshots in `.fx_history.json`")
+    else:
+        lines.append(f"- ⚠️ Live fetch failed: {fx_ts}")
+
+    lines += [
+        "",
+        "## 3️⃣ Lãi suất",
+        f"- Verdict: **{rate_verdict}**",
+        f"- {rate_desc}",
+        f"- Latest observation: {rate_info['date'] or 'none'}",
+    ]
+    if rate_info["interbank_on"] is not None:
+        lines.append(f"- Interbank ON: {rate_info['interbank_on']:.2f}%")
+    if rate_info["deposit_12m"] is not None:
+        lines.append(f"- Deposit 12M: {rate_info['deposit_12m']:.2f}%")
+
+    lines += [
+        "",
+        "---",
+        "",
+        f"## 🎯 Chế độ vĩ mô: **{regime}**",
+        "",
+        regime_desc,
+        "",
+        "### Positioning",
+    ]
+    lines += [f"- {p}" for p in positioning]
+
+    lines += [
+        "",
+        "---",
+        "*Freshness: CPI/rates via `manage_*_series` manual entry (as fresh as user updates). USD/VND live from Vietcombank on every call.*",
+    ]
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+@register_tool(
+    name='get_quality_score',
+    description='Compute a single 0-100 quality score for a VN stock from: ROIC, FCF/NI, debt/equity, revenue CAGR, and gross margin stability. Phase 4 pattern recognition tool — use to screen for compounders quickly and rank watchlist candidates.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN ticker symbol (e.g. FPT).'}}, 'required': ['ticker']},
+)
 async def _get_quality_score(args: dict) -> list[types.TextContent]:
     ticker: str = args["ticker"].upper()
     try:
@@ -3720,19 +4071,6 @@ async def _get_quality_score(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=text)]
 
 
-# Sector beta proxies for VN market (vs VN-Index baseline = 1.0)
-_SECTOR_BETAS = {
-    "real estate": 1.4, "bất động sản": 1.4,
-    "banking": 1.1, "ngân hàng": 1.1, "bank": 1.1,
-    "technology": 1.2, "công nghệ": 1.2, "it services": 1.2,
-    "steel": 1.5, "thép": 1.5, "materials": 1.4,
-    "consumer staples": 0.7, "hàng tiêu dùng thiết yếu": 0.7,
-    "consumer discretionary": 1.1, "retail": 1.1,
-    "utilities": 0.5, "điện": 0.6, "tiện ích": 0.5,
-    "aviation": 1.6, "hàng không": 1.6,
-    "oil & gas": 1.3, "dầu khí": 1.3, "energy": 1.3,
-    "telecommunications": 0.9, "viễn thông": 0.9,
-}
 
 
 def _lookup_sector_beta(sector: str) -> float:
@@ -3743,6 +4081,11 @@ def _lookup_sector_beta(sector: str) -> float:
     return 1.0
 
 
+@register_tool(
+    name='stress_test_portfolio',
+    description='Simulate portfolio P&L under three market shock scenarios: -10%, -20%, -30% VN-Index decline. Applies sector beta proxies (banking 1.1, real estate 1.4, tech 1.2, staples 0.7) to each holding. Returns total loss in VND, by-position breakdown, and triggers drawdown rule warnings.',
+    input_schema={'type': 'object', 'properties': {'holdings': {'type': 'array', 'items': {'type': 'object', 'properties': {'ticker': {'type': 'string'}, 'shares': {'type': 'number'}, 'avg_cost': {'type': 'number'}}, 'required': ['ticker', 'shares', 'avg_cost']}, 'description': 'List of holdings, e.g. [{"ticker":"FPT","shares":1000,"avg_cost":130000}].'}}, 'required': ['holdings']},
+)
 async def _stress_test_portfolio(args: dict) -> list[types.TextContent]:
     holdings: list = args["holdings"]
 
@@ -3869,6 +4212,11 @@ def _save_watchlist(tickers: list[str]) -> None:
     WATCHLIST_PATH.write_text(json.dumps(sorted(set(tickers)), indent=2), encoding="utf-8")
 
 
+@register_tool(
+    name='manage_watchlist',
+    description='Add, remove, or list tickers in your personal watchlist (stored in .watchlist.json). Use `check_watchlist` afterwards to scan all tickers for technical triggers.',
+    input_schema={'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['add', 'remove', 'list', 'clear']}, 'ticker': {'type': 'string', 'description': 'Required for add/remove. Ignored for list/clear.'}}, 'required': ['action']},
+)
 async def _manage_watchlist(args: dict) -> list[types.TextContent]:
     action: str = args["action"].lower()
     ticker: str = args.get("ticker", "").upper().strip()
@@ -3957,6 +4305,11 @@ async def _scan_ticker_for_triggers(ticker: str) -> dict:
         return {"ticker": ticker, "error": str(e)}
 
 
+@register_tool(
+    name='check_watchlist',
+    description="Scan every ticker in your watchlist for actionable technical triggers: RSI <30 (oversold), RSI >70 (overbought), MA50 break (above or below), and >5% daily moves. Run at the start of every session to surface what's worth attention.",
+    input_schema={'type': 'object', 'properties': {}, 'required': []},
+)
 async def _check_watchlist(_args: dict) -> list[types.TextContent]:
     watchlist = _load_watchlist()
     if not watchlist:
@@ -4028,6 +4381,11 @@ _SECTOR_PRINCIPLE_KEYWORDS: dict[str, list[str]] = {
 }
 
 
+@register_tool(
+    name='thesis_context',
+    description='Bundle pre-thesis context for a VN ticker: recent news mentioning it, your existing analyses/theses, and matching sector principles from the knowledge base (Buffett, Marks, Damodaran). Call this FIRST when writing a new thesis or revisiting an existing position — it surfaces what you already know and what the corpus says about similar businesses, saving you 30-60 min of recall.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN ticker symbol (uppercase, e.g. FPT).'}, 'lookback_days': {'type': 'integer', 'default': 30, 'description': 'How far back to pull news (default 30).'}, 'max_articles': {'type': 'integer', 'default': 15, 'description': 'Cap on recent articles included (default 15).'}, 'include_sector_principles': {'type': 'boolean', 'default': True, 'description': 'Include matching passages from books/blogs (Buffett, Marks, etc.).'}}, 'required': ['ticker']},
+)
 async def _thesis_context(args: dict) -> list[types.TextContent]:
     import re
     ticker: str = args["ticker"].upper()
@@ -4190,6 +4548,11 @@ _TOPIC_SYNONYMS: dict[str, list[str]] = {
 }
 
 
+@register_tool(
+    name='compare_authors_on',
+    description="Cross-reference engine: for a topic and a list of authors, pull every passage from each author's corpus discussing that topic. Use this to learn where investing legends actually DISAGREE — Marks vs Buffett on cyclicality, Damodaran vs Mauboussin on growth, etc. Returns a structured markdown block with passages grouped by author and ready for synthesis.",
+    input_schema={'type': 'object', 'properties': {'topic': {'type': 'string', 'description': "Topic to compare, e.g. 'cyclicality' or 'intrinsic value'."}, 'authors': {'type': 'array', 'items': {'type': 'string'}, 'description': "List of author names (substring match, e.g. ['Warren Buffett', 'Howard Marks']).", 'minItems': 1}, 'keywords': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Optional explicit keyword list. If omitted, the topic plus naive synonyms are used.'}, 'context_paragraphs': {'type': 'integer', 'default': 2, 'description': 'Paragraphs of surrounding context per match (default 2).'}, 'max_per_author': {'type': 'integer', 'default': 5, 'description': 'Cap on passages per author (default 5).'}}, 'required': ['topic', 'authors']},
+)
 async def _compare_authors_on(args: dict) -> list[types.TextContent]:
     import re
     topic: str = args["topic"]
@@ -4266,6 +4629,11 @@ async def _compare_authors_on(args: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text="\n".join(lines))]
 
 
+@register_tool(
+    name='correlate_news_to_price',
+    description="Quantify how a ticker's news flow relates to its price action. Pulls articles + daily prices over the lookback window, scores each article's sentiment (keyword-based, VN + EN), then computes cross-correlation at lags −2/−1/0/+1/+2 days between news volume + net sentiment and returns. Tells you whether news LEADS price (information edge), REACTS to price (noise), or is uncorrelated (irrelevant). Surfaces spike days with headlines.",
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN ticker symbol (uppercase, e.g. FPT).'}, 'lookback_days': {'type': 'integer', 'default': 90, 'description': 'Trading days to analyze (default 90; min 30 for statistical signal).'}}, 'required': ['ticker']},
+)
 async def _correlate_news_to_price(args: dict) -> list[types.TextContent]:
     """K-NPC: news ↔ price correlation analysis with sentiment + lag cross-correlation."""
     ticker: str = args["ticker"].upper()
@@ -4500,6 +4868,1706 @@ async def _correlate_news_to_price(args: dict) -> list[types.TextContent]:
         text = f"News-price correlation failed for {ticker}: {type(e).__name__}: {e}"
 
     return [types.TextContent(type="text", text=text)]
+
+
+@register_tool(
+    name='get_money_flow_price_action',
+    description='Analyze money flow (dòng tiền) and price action (hành động giá) for a VN-listed stock. Combines volume-based flow indicators (MFI, OBV, CMF, A/D line, up/down-day volume ratio, climax days) with pure price-action reading (recent candlestick patterns, HH/HL trend structure, gaps, 20-day range breakouts, Wyckoff Spring/Upthrust false-breakout events, and price vs OBV/MFI divergence). Complements get_technical_analysis (which focuses on MA/RSI/MACD/BB) by surfacing whether smart money is accumulating or distributing under the surface. Returns a scored verdict: ACCUMULATION / DISTRIBUTION / NEUTRAL.',
+    input_schema={'type': 'object', 'properties': {'ticker': {'type': 'string', 'description': 'VN stock ticker symbol (uppercase, e.g. FPT).'}, 'days': {'type': 'integer', 'description': 'Number of trading days of history to use (default 180).', 'default': 180}}, 'required': ['ticker']},
+)
+async def _get_money_flow_price_action(args: dict) -> list[types.TextContent]:
+    ticker = args["ticker"].upper()
+    days = int(args.get("days", 180))
+
+    try:
+        import pandas as pd
+        import pandas_ta as ta
+
+        raw = await _vnstock_subprocess("quote_history_full", {"ticker": ticker, "days": days})
+        rows = json.loads(raw)
+        if not rows or isinstance(rows, dict):
+            return [types.TextContent(type="text", text=f"No price data for {ticker}")]
+
+        df = pd.DataFrame(rows)
+        df["close"] = df["close"].astype(float) * 1000
+        df["open"] = df["open"].astype(float) * 1000
+        df["high"] = df["high"].astype(float) * 1000
+        df["low"] = df["low"].astype(float) * 1000
+        df["volume"] = df["volume"].astype(float)
+        df = df.sort_values("time").reset_index(drop=True)
+        n = len(df)
+
+        if n < 30:
+            return [types.TextContent(
+                type="text",
+                text=f"Insufficient data for {ticker} — need at least 30 trading days, got {n}."
+            )]
+
+        close, high, low, vol = df["close"], df["high"], df["low"], df["volume"]
+        price = float(close.iloc[-1])
+
+        # ── Money Flow Indicators ─────────────────────────────────────────
+        mfi_s = ta.mfi(high, low, close, vol, length=14)
+        mfi = float(mfi_s.iloc[-1]) if mfi_s is not None and not mfi_s.empty else None
+
+        obv_s = ta.obv(close, vol)
+        obv_slope = _slope_normalized(obv_s.tail(20)) if obv_s is not None else 0.0
+
+        cmf_s = ta.cmf(high, low, close, vol, length=20)
+        cmf = float(cmf_s.iloc[-1]) if cmf_s is not None and not cmf_s.empty else None
+
+        ad_s = ta.ad(high, low, close, vol)
+        ad_slope = _slope_normalized(ad_s.tail(20)) if ad_s is not None else 0.0
+
+        # ── Volume Distribution (up-day vs down-day, last 30 sessions) ────
+        recent = df.tail(30).copy()
+        recent["ret"] = recent["close"].pct_change()
+        up_vol = float(recent.loc[recent["ret"] > 0, "volume"].sum())
+        down_vol = float(recent.loc[recent["ret"] < 0, "volume"].sum())
+        vol_ratio = up_vol / down_vol if down_vol > 0 else float("inf")
+
+        vol_ma = float(vol.rolling(20).mean().iloc[-1])
+        climax_mask = recent["volume"] > 2 * vol_ma
+        green_climax = int(((recent["ret"] > 0) & climax_mask).sum())
+        red_climax = int(((recent["ret"] < 0) & climax_mask).sum())
+
+        # ── Price Action Patterns ─────────────────────────────────────────
+        candle_patterns = _detect_candle_patterns(df)
+        structure, highs, lows = _pivot_structure(df)
+        gaps = _detect_gaps(df)
+
+        # ── Range Breakouts (20-day) ──────────────────────────────────────
+        prev_20_high = float(df["high"].iloc[-21:-1].max()) if n >= 21 else float(df["high"].iloc[:-1].max())
+        prev_20_low = float(df["low"].iloc[-21:-1].min()) if n >= 21 else float(df["low"].iloc[:-1].min())
+        breakout_up = price > prev_20_high
+        breakdown = price < prev_20_low
+        last_vol_ratio = float(vol.iloc[-1]) / vol_ma if vol_ma else 1.0
+
+        # ── Divergences ───────────────────────────────────────────────────
+        obv_divergence = _detect_divergence(close, obv_s, "OBV") if obv_s is not None else None
+        mfi_divergence = _detect_divergence(close, mfi_s, "MFI") if mfi_s is not None else None
+
+        # ── Wyckoff events (Spring / Upthrust) ────────────────────────────
+        wyckoff_events = _detect_wyckoff_events(df, lookback=10, range_window=20)
+        latest_spring = next((e for e in reversed(wyckoff_events) if e["type"] == "spring"), None)
+        latest_upthrust = next((e for e in reversed(wyckoff_events) if e["type"] == "upthrust"), None)
+
+        # ── Verdict scoring ───────────────────────────────────────────────
+        score = 0
+        rationale: list[str] = []
+        if mfi is not None:
+            if mfi < 20:
+                score += 2; rationale.append(f"MFI {mfi:.0f} <20 (oversold)")
+            elif mfi > 80:
+                score -= 2; rationale.append(f"MFI {mfi:.0f} >80 (overbought)")
+        if cmf is not None:
+            if cmf > 0.1:
+                score += 2; rationale.append(f"CMF {cmf:+.2f} strong inflow")
+            elif cmf < -0.1:
+                score -= 2; rationale.append(f"CMF {cmf:+.2f} strong outflow")
+        if obv_slope > 0.5:
+            score += 1; rationale.append(f"OBV rising ({obv_slope:+.1f}%/bar)")
+        elif obv_slope < -0.5:
+            score -= 1; rationale.append(f"OBV falling ({obv_slope:+.1f}%/bar)")
+        if vol_ratio > 1.5:
+            score += 1; rationale.append(f"Up-vol / down-vol = {vol_ratio:.2f}x")
+        elif vol_ratio < 0.67:
+            score -= 1; rationale.append(f"Down-vol dominates ({vol_ratio:.2f}x up/down)")
+        if green_climax > red_climax + 1:
+            score += 1; rationale.append(f"{green_climax} green climax days vs {red_climax} red")
+        elif red_climax > green_climax + 1:
+            score -= 1; rationale.append(f"{red_climax} red climax days vs {green_climax} green")
+        if obv_divergence and "Bearish" in obv_divergence:
+            score -= 2; rationale.append("Bearish OBV divergence")
+        if obv_divergence and "Bullish" in obv_divergence:
+            score += 2; rationale.append("Bullish OBV divergence")
+        if breakout_up and last_vol_ratio > 1.5:
+            score += 2; rationale.append(f"20-day breakout on {last_vol_ratio:.1f}x volume")
+        elif breakdown and last_vol_ratio > 1.5:
+            score -= 2; rationale.append(f"20-day breakdown on {last_vol_ratio:.1f}x volume")
+
+        # Wyckoff Spring = failed breakdown → accumulation. Upthrust = failed breakout → distribution.
+        if latest_spring:
+            bonus = 3 if latest_spring["vol_ratio"] > 1.5 else 2
+            score += bonus
+            rationale.append(
+                f"Wyckoff Spring on {latest_spring['date']} "
+                f"(broke -{latest_spring['depth_pct']:.1f}% below support, reclaimed on {latest_spring['vol_ratio']:.1f}× vol)"
+            )
+        if latest_upthrust:
+            bonus = 3 if latest_upthrust["vol_ratio"] > 1.5 else 2
+            score -= bonus
+            rationale.append(
+                f"Wyckoff Upthrust on {latest_upthrust['date']} "
+                f"(broke +{latest_upthrust['depth_pct']:.1f}% above resistance, rejected on {latest_upthrust['vol_ratio']:.1f}× vol)"
+            )
+
+        if score >= 4: verdict = "🟢 ACCUMULATION"
+        elif score >= 2: verdict = "🟢 MILD ACCUMULATION"
+        elif score <= -4: verdict = "🔴 DISTRIBUTION"
+        elif score <= -2: verdict = "🟠 MILD DISTRIBUTION"
+        else: verdict = "⚪ NEUTRAL / CHURN"
+
+        # ── Render ────────────────────────────────────────────────────────
+        lines = [
+            f"## Money Flow & Price Action — {ticker}",
+            f"**Verdict: {verdict}** (score: {score:+d})",
+            f"*Current price: {price:,.0f} VND — based on {n} trading days.*",
+            "",
+            "### Money Flow Indicators",
+            "| Indicator | Value | Read |",
+            "|---|---:|---|",
+        ]
+        if mfi is not None:
+            mfi_read = "🟢 oversold" if mfi < 20 else "🔴 overbought" if mfi > 80 else "neutral"
+            lines.append(f"| MFI (14) | {mfi:.1f} | {mfi_read} |")
+        if cmf is not None:
+            cmf_read = "🟢 strong inflow" if cmf > 0.1 else "🔴 strong outflow" if cmf < -0.1 else "neutral"
+            lines.append(f"| CMF (20) | {cmf:+.3f} | {cmf_read} |")
+        obv_read = "🟢 rising" if obv_slope > 0.5 else "🔴 falling" if obv_slope < -0.5 else "flat"
+        lines.append(f"| OBV slope (20d) | {obv_slope:+.2f}%/bar | {obv_read} |")
+        ad_read = "🟢 rising" if ad_slope > 0.5 else "🔴 falling" if ad_slope < -0.5 else "flat"
+        lines.append(f"| A/D line slope (20d) | {ad_slope:+.2f}%/bar | {ad_read} |")
+
+        lines += [
+            "",
+            "### Volume Distribution (last 30 sessions)",
+            f"- Up-day volume: **{up_vol:,.0f}** vs Down-day volume: **{down_vol:,.0f}**",
+            f"- Ratio: **{vol_ratio:.2f}x** {'(bulls control tape)' if vol_ratio > 1.5 else '(bears control tape)' if vol_ratio < 0.67 else '(balanced)'}",
+            f"- Volume climax days (>2× avg): **{green_climax} green** / **{red_climax} red**",
+        ]
+
+        lines += ["", "### Recent Candlestick Patterns (last 5 sessions)"]
+        lines += candle_patterns if candle_patterns else ["  *No notable patterns detected.*"]
+
+        lines += [
+            "",
+            "### Trend Structure (30d pivot analysis)",
+            f"  {structure}",
+        ]
+        if highs and lows:
+            lines.append(f"  Recent pivot highs: {', '.join(f'{h:,.0f}' for h in highs[-3:])}")
+            lines.append(f"  Recent pivot lows:  {', '.join(f'{l:,.0f}' for l in lows[-3:])}")
+
+        lines += ["", "### Gaps (last 20 sessions, ≥1%)"]
+        lines += gaps if gaps else ["  *No significant gaps.*"]
+
+        lines += [
+            "",
+            "### Range Breakouts (20-day)",
+            f"  Prior 20-day high: {prev_20_high:,.0f} — current price is {(price - prev_20_high) / prev_20_high * 100:+.1f}%",
+            f"  Prior 20-day low:  {prev_20_low:,.0f} — current price is {(price - prev_20_low) / prev_20_low * 100:+.1f}%",
+        ]
+        if breakout_up:
+            lines.append(f"  🟢 **Breakout above 20-day high** on {last_vol_ratio:.1f}× avg volume")
+        if breakdown:
+            lines.append(f"  🔴 **Breakdown below 20-day low** on {last_vol_ratio:.1f}× avg volume")
+
+        lines += ["", "### Wyckoff Events — Spring / Upthrust (last 10 sessions, 20-day range)"]
+        if wyckoff_events:
+            for e in wyckoff_events:
+                if e["type"] == "spring":
+                    vol_flag = " · HIGH VOL 🔥" if e["vol_ratio"] > 1.5 else ""
+                    lines.append(
+                        f"  🟢 **Spring** on {e['date']} — dipped -{e['depth_pct']:.2f}% below support "
+                        f"({e['prev_support']:,.0f}) to {e['session_low']:,.0f}, closed back at "
+                        f"{e['session_close']:,.0f} on {e['vol_ratio']:.1f}× avg vol{vol_flag}"
+                    )
+                else:
+                    vol_flag = " · HIGH VOL 🔥" if e["vol_ratio"] > 1.5 else ""
+                    lines.append(
+                        f"  🔴 **Upthrust** on {e['date']} — spiked +{e['depth_pct']:.2f}% above resistance "
+                        f"({e['prev_resistance']:,.0f}) to {e['session_high']:,.0f}, closed back at "
+                        f"{e['session_close']:,.0f} on {e['vol_ratio']:.1f}× avg vol{vol_flag}"
+                    )
+            lines.append("")
+            lines.append(
+                "*Wyckoff interpretation: Spring = failed breakdown, "
+                "institutional accumulation catching the stops. Upthrust = failed breakout, "
+                "supply overwhelming demand at resistance. High volume amplifies conviction — "
+                "confirm with 2-3 sessions of follow-through before acting.*"
+            )
+        else:
+            lines.append("  *No Spring/Upthrust events detected — price respecting the trading range.*")
+
+        divergences = [d for d in (obv_divergence, mfi_divergence) if d]
+        lines += ["", "### Divergences"]
+        lines += [f"  {d}" for d in divergences] if divergences else ["  *No divergences detected in last 20 sessions.*"]
+
+        lines += [
+            "",
+            "### Verdict Rationale",
+        ]
+        lines += [f"  - {r}" for r in rationale] if rationale else ["  *No decisive signals — sideways/quiet tape.*"]
+
+        lines += [
+            "",
+            "### How to read this",
+            "- **Accumulation** = money flowing in quietly (rising OBV, positive CMF, up-vol > down-vol) — often precedes a markup phase",
+            "- **Distribution** = money flowing out under the surface (bearish divergence, red climax days, negative CMF) — often precedes a markdown",
+            "- **Divergence** is the highest-conviction signal — when price and OBV/MFI disagree, the indicator usually wins",
+            "- Combine with `get_technical_analysis` (trend + momentum) and `get_foreign_flow` (foreign net buy) for a complete tape read",
+        ]
+
+        text = "\n".join(lines)
+
+    except Exception as e:
+        text = f"Money flow / price action analysis failed for {ticker}: {type(e).__name__}: {e}"
+
+    return [types.TextContent(type="text", text=text)]
+
+
+@register_tool(
+    name='manage_portfolio',
+    description='Persistent portfolio manager — CRUD holdings in `.portfolio.json`. Actions: `list` (show all), `add` (create or replace ticker), `remove`, `set_cash` (set VND cash balance), `clear` (wipe holdings, keep cash). Portfolio state is the foundation for `get_portfolio_overview`, `get_portfolio_risk`, and `get_rebalancing_suggestions`.',
+    input_schema={'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['list', 'add', 'remove', 'set_cash', 'clear'], 'description': 'Action to perform.'}, 'ticker': {'type': 'string', 'description': 'VN ticker for add/remove.'}, 'shares': {'type': 'number', 'description': 'Shares held (for add).'}, 'avg_cost': {'type': 'number', 'description': 'Average cost per share in VND (for add).'}, 'target_weight': {'type': 'number', 'description': 'Target portfolio weight in % (0-100) for rebalancing. Optional.'}, 'cash_vnd': {'type': 'number', 'description': 'Cash balance in VND (for set_cash).'}, 'notes': {'type': 'string', 'description': 'Free-form notes (for add). Optional.'}}, 'required': ['action']},
+)
+async def _manage_portfolio(args: dict) -> list[types.TextContent]:
+    action = str(args.get("action", "")).lower().strip()
+    portfolio = _load_portfolio()
+
+    if action == "list":
+        h = portfolio["holdings"]
+        cash = portfolio["cash_vnd"]
+        if not h and not cash:
+            return [types.TextContent(
+                type="text",
+                text="Portfolio is empty. Add positions with `manage_portfolio(action='add', ticker='FPT', shares=1000, avg_cost=65000)`."
+            )]
+        lines = [
+            f"## Portfolio ({len(h)} positions, cash {cash/1e6:,.1f}M VND)",
+            "",
+            "| Ticker | Shares | Avg Cost | Target % | Notes |",
+            "|---|---:|---:|---:|---|",
+        ]
+        for row in sorted(h, key=lambda x: x.get("ticker", "")):
+            tgt = row.get("target_weight")
+            tgt_str = f"{tgt:.1f}%" if tgt is not None else "—"
+            notes = (row.get("notes") or "")[:40]
+            lines.append(
+                f"| {row['ticker']} | {row['shares']:,.0f} | {row['avg_cost']:,.0f} | {tgt_str} | {notes} |"
+            )
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    if action == "clear":
+        portfolio["holdings"] = []
+        _save_portfolio(portfolio)
+        return [types.TextContent(type="text", text=f"Holdings cleared. Cash preserved: {portfolio['cash_vnd']/1e6:,.1f}M VND.")]
+
+    if action == "set_cash":
+        cash = args.get("cash_vnd")
+        if cash is None:
+            return [types.TextContent(type="text", text="`cash_vnd` is required for set_cash.")]
+        portfolio["cash_vnd"] = float(cash)
+        _save_portfolio(portfolio)
+        return [types.TextContent(type="text", text=f"Cash set to {float(cash)/1e6:,.1f}M VND.")]
+
+    ticker = str(args.get("ticker", "")).upper().strip()
+    if not ticker:
+        return [types.TextContent(type="text", text="`ticker` is required for add/remove.")]
+
+    if action == "remove":
+        before = len(portfolio["holdings"])
+        portfolio["holdings"] = [h for h in portfolio["holdings"] if h["ticker"] != ticker]
+        if len(portfolio["holdings"]) == before:
+            return [types.TextContent(type="text", text=f"{ticker} not in portfolio.")]
+        _save_portfolio(portfolio)
+        return [types.TextContent(type="text", text=f"Removed {ticker}. Portfolio now {len(portfolio['holdings'])} positions.")]
+
+    if action == "add":
+        shares = args.get("shares")
+        avg_cost = args.get("avg_cost")
+        if shares is None or avg_cost is None:
+            return [types.TextContent(type="text", text="`shares` and `avg_cost` are required for add.")]
+        from datetime import date
+        entry = {
+            "ticker": ticker,
+            "shares": float(shares),
+            "avg_cost": float(avg_cost),
+            "opened_at": date.today().isoformat(),
+        }
+        if args.get("target_weight") is not None:
+            entry["target_weight"] = float(args["target_weight"])
+        if args.get("notes"):
+            entry["notes"] = str(args["notes"])
+        portfolio["holdings"] = [h for h in portfolio["holdings"] if h["ticker"] != ticker]
+        portfolio["holdings"].append(entry)
+        _save_portfolio(portfolio)
+        return [types.TextContent(
+            type="text",
+            text=f"Added {ticker}: {float(shares):,.0f} shares @ {float(avg_cost):,.0f} VND. Portfolio now {len(portfolio['holdings'])} positions."
+        )]
+
+    return [types.TextContent(type="text", text=f"Unknown action: {action}. Use list/add/remove/set_cash/clear.")]
+
+
+async def _enrich_holdings(portfolio: dict) -> list[dict]:
+    """Fetch current price + sector for each holding and combine with stored data."""
+    holdings = portfolio.get("holdings", [])
+    if not holdings:
+        return []
+    snapshots = await asyncio.gather(*[
+        _fetch_holding_snapshot(h["ticker"]) for h in holdings
+    ])
+    snap_by_ticker = {s["ticker"]: s for s in snapshots}
+    rows = []
+    for h in holdings:
+        snap = snap_by_ticker.get(h["ticker"], {})
+        current = float(snap.get("current_price") or h["avg_cost"])
+        rows.append({
+            **h,
+            "sector": snap.get("sector", "N/A"),
+            "current_price": current,
+            "market_value": current * float(h["shares"]),
+            "cost_basis": float(h["avg_cost"]) * float(h["shares"]),
+        })
+    return rows
+
+
+@register_tool(
+    name='get_portfolio_overview',
+    description='Show current portfolio state: total value, cost basis, unrealized P&L, per-position table (ticker, sector, weight%, market value, P&L), cash %, sector allocation, top holdings, current drawdown from peak. Fetches live prices from vnstock. Also updates the persisted peak_value when a new all-time high is reached.',
+    input_schema={'type': 'object', 'properties': {}, 'required': []},
+)
+async def _get_portfolio_overview(_args: dict) -> list[types.TextContent]:
+    portfolio = _load_portfolio()
+    holdings = portfolio.get("holdings", [])
+    cash = float(portfolio.get("cash_vnd", 0))
+
+    if not holdings and cash == 0:
+        return [types.TextContent(
+            type="text",
+            text="Portfolio is empty. Add positions with `manage_portfolio(action='add', ...)` first."
+        )]
+
+    rows = await _enrich_holdings(portfolio)
+    equity_value = sum(r["market_value"] for r in rows)
+    cost_basis_equity = sum(r["cost_basis"] for r in rows)
+    total_value = equity_value + cash
+    pnl_abs = equity_value - cost_basis_equity
+    pnl_pct = pnl_abs / cost_basis_equity * 100 if cost_basis_equity else 0.0
+
+    # Update peak if we made a new high
+    from datetime import date
+    peak = float(portfolio.get("peak_value", 0))
+    peak_date = portfolio.get("peak_date", "")
+    if total_value > peak:
+        portfolio["peak_value"] = total_value
+        portfolio["peak_date"] = date.today().isoformat()
+        _save_portfolio(portfolio)
+        peak = total_value
+        peak_date = portfolio["peak_date"]
+    drawdown_pct = (total_value - peak) / peak * 100 if peak else 0.0
+
+    _append_snapshot(total_value, equity_value, cash)
+
+    lines = [
+        "## Portfolio Overview",
+        f"**Total value: {total_value/1e6:,.2f}M VND** "
+        f"(equity {equity_value/1e6:,.2f}M + cash {cash/1e6:,.2f}M)",
+        f"Cost basis (equity): {cost_basis_equity/1e6:,.2f}M VND | "
+        f"**Unrealized P&L: {pnl_abs/1e6:+,.2f}M VND ({pnl_pct:+.2f}%)**",
+        f"Peak value: {peak/1e6:,.2f}M VND on {peak_date or 'N/A'} | "
+        f"**Drawdown from peak: {drawdown_pct:+.2f}%**",
+        "",
+        "### Positions",
+        "| Ticker | Sector | Shares | Avg Cost | Current | Mkt Value | Weight | P&L | P&L % |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for r in sorted(rows, key=lambda x: -x["market_value"]):
+        weight = r["market_value"] / total_value * 100 if total_value else 0
+        pnl_i = r["market_value"] - r["cost_basis"]
+        pnl_pct_i = pnl_i / r["cost_basis"] * 100 if r["cost_basis"] else 0
+        sector_short = (r["sector"][:16] + "…") if len(r["sector"]) > 16 else r["sector"]
+        lines.append(
+            f"| {r['ticker']} | {sector_short} | {r['shares']:,.0f} | "
+            f"{r['avg_cost']:,.0f} | {r['current_price']:,.0f} | "
+            f"{r['market_value']/1e6:,.2f}M | {weight:.1f}% | "
+            f"{pnl_i/1e6:+,.2f}M | {pnl_pct_i:+.1f}% |"
+        )
+    cash_weight = cash / total_value * 100 if total_value else 0
+    lines.append(f"| CASH | — | — | — | — | {cash/1e6:,.2f}M | {cash_weight:.1f}% | — | — |")
+
+    # Sector allocation
+    sector_alloc: dict[str, float] = {}
+    for r in rows:
+        sector_alloc[r["sector"]] = sector_alloc.get(r["sector"], 0) + r["market_value"]
+    lines += [
+        "",
+        "### Sector Allocation",
+        "| Sector | Value | Weight |",
+        "|---|---:|---:|",
+    ]
+    for sector, val in sorted(sector_alloc.items(), key=lambda x: -x[1]):
+        w = val / total_value * 100 if total_value else 0
+        lines.append(f"| {sector} | {val/1e6:,.2f}M | {w:.1f}% |")
+    lines.append(f"| Cash | {cash/1e6:,.2f}M | {cash_weight:.1f}% |")
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+async def _fetch_returns(ticker: str, days: int = 90) -> list[float] | None:
+    """Fetch daily close-to-close returns for correlation. Returns None on failure."""
+    raw = await _vnstock_subprocess("quote_history_full", {"ticker": ticker, "days": days})
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not rows or isinstance(rows, dict) or len(rows) < 20:
+        return None
+    closes = [float(r["close"]) for r in rows if r.get("close") is not None]
+    if len(closes) < 20:
+        return None
+    return [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes))]
+
+
+@register_tool(
+    name='get_portfolio_risk',
+    description='Compute portfolio-level risk metrics: concentration (single position + sector vs 20% / 35% limits), beta-weighted exposure vs VN-Index, correlation matrix of top holdings (60-day returns, flags pairs ≥ 0.7), dry powder %, current drawdown from peak, and a scored risk verdict (LOW / MODERATE / ELEVATED / HIGH). Use before adding new positions or when portfolio drifts.',
+    input_schema={'type': 'object', 'properties': {}, 'required': []},
+)
+async def _get_portfolio_risk(_args: dict) -> list[types.TextContent]:
+    portfolio = _load_portfolio()
+    holdings = portfolio.get("holdings", [])
+    cash = float(portfolio.get("cash_vnd", 0))
+
+    if not holdings:
+        return [types.TextContent(
+            type="text",
+            text="Portfolio is empty. Add positions with `manage_portfolio` first."
+        )]
+
+    rows = await _enrich_holdings(portfolio)
+    equity_value = sum(r["market_value"] for r in rows)
+    total_value = equity_value + cash
+
+    # ── Concentration ────────────────────────────────────────────────────
+    max_pos = max((r["market_value"] / total_value * 100 for r in rows), default=0.0)
+    max_pos_ticker = max(rows, key=lambda x: x["market_value"])["ticker"] if rows else "—"
+    sector_alloc: dict[str, float] = {}
+    for r in rows:
+        sector_alloc[r["sector"]] = sector_alloc.get(r["sector"], 0) + r["market_value"]
+    max_sector = max(sector_alloc.items(), key=lambda x: x[1]) if sector_alloc else ("N/A", 0)
+    max_sector_pct = max_sector[1] / total_value * 100 if total_value else 0
+
+    # ── Beta-weighted exposure ───────────────────────────────────────────
+    beta_weighted = sum(
+        (r["market_value"] / total_value) * _lookup_sector_beta(r["sector"])
+        for r in rows
+    ) if total_value else 0.0
+
+    # ── Correlation matrix (top 6 holdings by weight) ────────────────────
+    top = sorted(rows, key=lambda x: -x["market_value"])[:6]
+    top_tickers = [r["ticker"] for r in top]
+    returns_list = await asyncio.gather(*[_fetch_returns(t) for t in top_tickers])
+    returns_map = {t: r for t, r in zip(top_tickers, returns_list) if r}
+
+    high_corr_pairs: list[tuple[str, str, float]] = []
+    for i, t1 in enumerate(top_tickers):
+        for t2 in top_tickers[i + 1:]:
+            if t1 in returns_map and t2 in returns_map:
+                c = _correlation(returns_map[t1], returns_map[t2])
+                if c is not None and c >= 0.7:
+                    high_corr_pairs.append((t1, t2, c))
+
+    # ── Drawdown ─────────────────────────────────────────────────────────
+    peak = float(portfolio.get("peak_value", 0)) or total_value
+    drawdown_pct = (total_value - peak) / peak * 100 if peak else 0.0
+    cash_pct = cash / total_value * 100 if total_value else 0
+
+    # ── Risk score ───────────────────────────────────────────────────────
+    score = 0
+    findings: list[str] = []
+    if max_pos > 25:
+        score += 3; findings.append(f"{max_pos_ticker} at {max_pos:.1f}% (severe overweight)")
+    elif max_pos > 20:
+        score += 2; findings.append(f"{max_pos_ticker} at {max_pos:.1f}% (over 20% cap)")
+    if max_sector_pct > 40:
+        score += 3; findings.append(f"{max_sector[0]} sector at {max_sector_pct:.1f}% (severe concentration)")
+    elif max_sector_pct > 35:
+        score += 2; findings.append(f"{max_sector[0]} sector at {max_sector_pct:.1f}% (over 35% cap)")
+    if beta_weighted > 1.3:
+        score += 2; findings.append(f"portfolio beta {beta_weighted:.2f} (high market sensitivity)")
+    elif beta_weighted > 1.15:
+        score += 1; findings.append(f"portfolio beta {beta_weighted:.2f} (moderate leverage to market)")
+    if len(high_corr_pairs) >= 3:
+        score += 2; findings.append(f"{len(high_corr_pairs)} correlated pairs ≥0.7 (diversification illusion)")
+    elif high_corr_pairs:
+        score += 1; findings.append(f"{len(high_corr_pairs)} correlated pair(s) ≥0.7")
+    if drawdown_pct < -15:
+        score += 3; findings.append(f"in {drawdown_pct:.1f}% drawdown from peak — capital preservation mode")
+    elif drawdown_pct < -8:
+        score += 1; findings.append(f"in {drawdown_pct:.1f}% drawdown — trim losers")
+    if cash_pct < 5 and len(rows) > 3:
+        score += 1; findings.append(f"cash only {cash_pct:.1f}% — no dry powder for opportunities")
+
+    if score >= 8: verdict = "🔴 HIGH"
+    elif score >= 5: verdict = "🟠 ELEVATED"
+    elif score >= 2: verdict = "🟡 MODERATE"
+    else: verdict = "🟢 LOW"
+
+    # ── Render ───────────────────────────────────────────────────────────
+    lines = [
+        "## Portfolio Risk Dashboard",
+        f"**Risk Level: {verdict}** (score: {score})",
+        f"*Portfolio value: {total_value/1e6:,.2f}M VND | {len(rows)} positions | Cash {cash_pct:.1f}%*",
+        "",
+        "### Concentration",
+        "| Metric | Value | Limit | Status |",
+        "|---|---:|---:|---|",
+        f"| Largest position ({max_pos_ticker}) | {max_pos:.1f}% | 20% | "
+        f"{'🔴 breach' if max_pos > 20 else '🟢 within limit'} |",
+        f"| Largest sector ({max_sector[0]}) | {max_sector_pct:.1f}% | 35% | "
+        f"{'🔴 breach' if max_sector_pct > 35 else '🟢 within limit'} |",
+        f"| Cash / dry powder | {cash_pct:.1f}% | 5-20% | "
+        f"{'🔴 no dry powder' if cash_pct < 5 else '🟡 low' if cash_pct < 10 else '🟢 healthy'} |",
+        "",
+        "### Market Sensitivity",
+        f"- **Portfolio beta (sector-weighted): {beta_weighted:.2f}** — a 10% VN-Index move implies ~{beta_weighted*10:.1f}% portfolio move",
+        f"- **Drawdown from peak: {drawdown_pct:+.2f}%** " + (
+            "(new high territory — stay disciplined)" if drawdown_pct >= 0 else
+            "(within normal band)" if drawdown_pct > -8 else
+            "(elevated — trim underperformers)" if drawdown_pct > -15 else
+            "(deep — capital preservation mode)"
+        ),
+        "",
+        "### Correlation Risk (top 6 holdings, 90-day returns)",
+    ]
+    if high_corr_pairs:
+        lines.append("| Pair | Correlation |")
+        lines.append("|---|---:|")
+        for t1, t2, c in sorted(high_corr_pairs, key=lambda x: -x[2]):
+            lines.append(f"| {t1} ↔ {t2} | {c:+.2f} |")
+        lines.append("")
+        lines.append("*Highly correlated pairs move together — diversification is weaker than position count suggests.*")
+    else:
+        lines.append("*No pairs above 0.7 correlation — decent diversification.*")
+
+    lines += ["", "### Findings"]
+    lines += [f"- {f}" for f in findings] if findings else ["- *No material risk findings.*"]
+
+    lines += [
+        "",
+        "### Risk Rules (VN market defaults)",
+        "- Single position: max 20% of portfolio",
+        "- Sector concentration: max 35%",
+        "- Portfolio beta: aim ≤ 1.15 for balanced exposure",
+        "- Cash: 5-20% dry powder for opportunities",
+        "- Drawdown: >15% triggers capital preservation (halve position sizes)",
+    ]
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+@register_tool(
+    name='get_rebalancing_suggestions',
+    description='Compare current portfolio weights vs target_weight set for each holding. Flags deviations above threshold (default 3%). Suggests trim/add trades sized in shares and VND to move each position back toward its target. Only considers holdings with a target_weight defined.',
+    input_schema={'type': 'object', 'properties': {'threshold_pct': {'type': 'number', 'description': 'Deviation threshold in % that triggers a rebalance (default 3.0).', 'default': 3.0}}, 'required': []},
+)
+async def _get_rebalancing_suggestions(args: dict) -> list[types.TextContent]:
+    threshold = float(args.get("threshold_pct", 3.0))
+    portfolio = _load_portfolio()
+    holdings = portfolio.get("holdings", [])
+    cash = float(portfolio.get("cash_vnd", 0))
+
+    with_targets = [h for h in holdings if h.get("target_weight") is not None]
+    if not with_targets:
+        return [types.TextContent(
+            type="text",
+            text=(
+                "No holdings have `target_weight` set. Add targets with "
+                "`manage_portfolio(action='add', ticker='FPT', shares=..., avg_cost=..., target_weight=15)`."
+            )
+        )]
+
+    rows = await _enrich_holdings(portfolio)
+    equity_value = sum(r["market_value"] for r in rows)
+    total_value = equity_value + cash
+
+    target_sum = sum(float(h["target_weight"]) for h in with_targets)
+    warnings: list[str] = []
+    if abs(target_sum - 100) > 1 and abs(target_sum - (100 - cash / total_value * 100 if total_value else 0)) > 1:
+        warnings.append(f"Target weights sum to {target_sum:.1f}% — expected ~100% (or 100% minus cash target)")
+
+    suggestions: list[dict] = []
+    for r in rows:
+        target = r.get("target_weight")
+        if target is None:
+            continue
+        current_weight = r["market_value"] / total_value * 100 if total_value else 0
+        deviation = current_weight - float(target)
+        if abs(deviation) < threshold:
+            continue
+        target_value = float(target) / 100 * total_value
+        delta_vnd = target_value - r["market_value"]
+        delta_shares = delta_vnd / r["current_price"] if r["current_price"] else 0
+        action = "TRIM" if delta_shares < 0 else "ADD"
+        suggestions.append({
+            "ticker": r["ticker"],
+            "current_weight": current_weight,
+            "target_weight": float(target),
+            "deviation": deviation,
+            "action": action,
+            "delta_shares": abs(delta_shares),
+            "delta_vnd": abs(delta_vnd),
+            "current_price": r["current_price"],
+        })
+
+    lines = [
+        "## Rebalancing Suggestions",
+        f"*Portfolio value: {total_value/1e6:,.2f}M VND | Threshold: ±{threshold:.1f}%*",
+        "",
+    ]
+    if warnings:
+        lines += [f"⚠️  {w}" for w in warnings] + [""]
+
+    if not suggestions:
+        lines.append(f"✅ All targeted positions within ±{threshold:.1f}% of target. No rebalancing needed.")
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    lines += [
+        "### Trades",
+        "| Ticker | Current | Target | Deviation | Action | Shares | VND | @ Price |",
+        "|---|---:|---:|---:|---|---:|---:|---:|",
+    ]
+    for s in sorted(suggestions, key=lambda x: -abs(x["deviation"])):
+        icon = "🔴 SELL" if s["action"] == "TRIM" else "🟢 BUY"
+        lines.append(
+            f"| {s['ticker']} | {s['current_weight']:.1f}% | {s['target_weight']:.1f}% | "
+            f"{s['deviation']:+.1f}% | {icon} | {s['delta_shares']:,.0f} | "
+            f"{s['delta_vnd']/1e6:,.2f}M | {s['current_price']:,.0f} |"
+        )
+
+    trim_total = sum(s["delta_vnd"] for s in suggestions if s["action"] == "TRIM")
+    add_total = sum(s["delta_vnd"] for s in suggestions if s["action"] == "ADD")
+    lines += [
+        "",
+        f"**Total to trim: {trim_total/1e6:,.2f}M VND** | **Total to add: {add_total/1e6:,.2f}M VND**",
+        f"Net cash impact: {(trim_total - add_total)/1e6:+,.2f}M VND",
+        "",
+        "*Execute trims first to free cash before adds. Consider tax/transaction costs — "
+        "if a deviation is small and stable, ignore it and revisit next quarter.*",
+    ]
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+async def _fetch_vnindex_history(days: int) -> list[dict]:
+    """Fetch VN-Index daily history via vnstock. Returns list of {date, close}."""
+    raw = await _vnstock_subprocess("quote_history_full", {"ticker": "VNINDEX", "days": days})
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not rows or isinstance(rows, dict):
+        return []
+    result = []
+    for r in rows:
+        t = r.get("time", "")
+        close = r.get("close")
+        if not t or close is None:
+            continue
+        result.append({"date": str(t)[:10], "close": float(close)})
+    return result
+
+
+@register_tool(
+    name='get_portfolio_returns',
+    description='Compute portfolio return metrics from daily snapshots (auto-saved to `.portfolio_snapshots.json` each time `get_portfolio_overview` runs). Returns: simple return since inception, annualized CAGR, Time-Weighted Return (TWR), period returns (YTD / 1M / 3M / 6M), max & current drawdown, annualized volatility, Sharpe ratio, and comparison vs VN-Index (alpha). Requires ≥2 snapshots — run `get_portfolio_overview` daily to build history.',
+    input_schema={'type': 'object', 'properties': {'risk_free_rate': {'type': 'number', 'description': 'Annual risk-free rate for Sharpe (default 4.0% — VN 10-year govt bond).', 'default': 4.0}}, 'required': []},
+)
+async def _get_portfolio_returns(args: dict) -> list[types.TextContent]:
+    from datetime import date
+    risk_free = float(args.get("risk_free_rate", 4.0)) / 100
+
+    snapshots = _load_snapshots()
+    if len(snapshots) < 2:
+        return [types.TextContent(
+            type="text",
+            text=(
+                f"Need at least 2 daily snapshots to compute returns (have {len(snapshots)}). "
+                "Run `get_portfolio_overview` each trading day to build history — a snapshot is "
+                "auto-saved to `.portfolio_snapshots.json` on every call."
+            )
+        )]
+
+    first = snapshots[0]
+    last = snapshots[-1]
+    first_v = float(first["total_value"])
+    last_v = float(last["total_value"])
+    total_days = (date.fromisoformat(last["date"]) - date.fromisoformat(first["date"])).days or 1
+
+    simple_return = (last_v / first_v - 1) if first_v > 0 else 0.0
+    cagr = _annualize(simple_return, total_days)
+
+    daily_returns = _daily_returns_from_snapshots(snapshots)
+    twr = _twr(daily_returns)
+    twr_cagr = _annualize(twr, total_days)
+
+    # Volatility (annualized, using trading days ≈ 252)
+    if len(daily_returns) >= 5:
+        mean_r = sum(daily_returns) / len(daily_returns)
+        variance = sum((r - mean_r) ** 2 for r in daily_returns) / (len(daily_returns) - 1) if len(daily_returns) > 1 else 0
+        daily_vol = variance ** 0.5
+        annual_vol = daily_vol * (252 ** 0.5)
+    else:
+        annual_vol = 0.0
+
+    sharpe = (twr_cagr - risk_free) / annual_vol if annual_vol > 0 else 0.0
+    max_dd, curr_dd = _rolling_drawdown(snapshots)
+
+    # YTD / 1M / 3M / 6M
+    period_returns: dict[str, tuple[float | None, int]] = {
+        "1M": period_return_from_snapshots(snapshots, 30),
+        "3M": period_return_from_snapshots(snapshots, 90),
+        "6M": period_return_from_snapshots(snapshots, 180),
+    }
+    year_start = f"{last['date'][:4]}-01-01"
+    ytd_start = _find_snapshot_at_or_before(snapshots, year_start) or first
+    ytd_return = (last_v / float(ytd_start["total_value"]) - 1) if float(ytd_start["total_value"]) > 0 else None
+    ytd_days = (date.fromisoformat(last["date"]) - date.fromisoformat(ytd_start["date"])).days
+
+    # vs VN-Index (spanning entire snapshot history)
+    lookback_days = max(total_days + 10, 30)
+    vnindex_hist = await _fetch_vnindex_history(lookback_days)
+    vn_return: float | None = None
+    vn_alpha: float | None = None
+    if vnindex_hist:
+        vn_start = _find_snapshot_at_or_before(vnindex_hist, first["date"]) or vnindex_hist[0]
+        vn_end = _find_snapshot_at_or_before(vnindex_hist, last["date"]) or vnindex_hist[-1]
+        vs, ve = float(vn_start["close"]), float(vn_end["close"])
+        if vs > 0:
+            vn_return = ve / vs - 1
+            vn_alpha = simple_return - vn_return
+
+    # ── Render ──────────────────────────────────────────────────────────
+    lines = [
+        "## Portfolio Returns",
+        f"*Based on {len(snapshots)} daily snapshots from {first['date']} to {last['date']} "
+        f"({total_days} calendar days)*",
+        "",
+        "### Headline",
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| Starting value | {first_v/1e6:,.2f}M VND |",
+        f"| Current value | {last_v/1e6:,.2f}M VND |",
+        f"| **Simple return** | **{simple_return*100:+.2f}%** |",
+        f"| **Annualized (CAGR)** | **{cagr*100:+.2f}%** |",
+        f"| Time-Weighted Return (TWR) | {twr*100:+.2f}% |",
+        f"| TWR annualized | {twr_cagr*100:+.2f}% |",
+        "",
+        "### Period Returns",
+        "| Period | Return | Actual days |",
+        "|---|---:|---:|",
+    ]
+    lines.append(
+        f"| YTD | {ytd_return*100:+.2f}% | {ytd_days} |" if ytd_return is not None
+        else "| YTD | — | — |"
+    )
+    for label, (ret, actual) in period_returns.items():
+        lines.append(
+            f"| {label} | {ret*100:+.2f}% | {actual} |" if ret is not None
+            else f"| {label} | — (insufficient history) | — |"
+        )
+
+    lines += [
+        "",
+        "### Risk-Adjusted",
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| Annualized volatility | {annual_vol*100:.2f}% |",
+        f"| Sharpe ratio (rf={risk_free*100:.1f}%) | {sharpe:+.2f} |",
+        f"| Max drawdown | {max_dd*100:+.2f}% |",
+        f"| Current drawdown | {curr_dd*100:+.2f}% |",
+    ]
+
+    lines += ["", "### vs VN-Index"]
+    if vn_return is not None:
+        lines += [
+            "| Metric | Portfolio | VN-Index | Alpha |",
+            "|---|---:|---:|---:|",
+            f"| Return over period | {simple_return*100:+.2f}% | {vn_return*100:+.2f}% | **{vn_alpha*100:+.2f}pp** |",
+        ]
+    else:
+        lines.append("*VN-Index history unavailable — check network / vnstock.*")
+
+    lines += [
+        "",
+        "### How to read",
+        "- **Simple return** measures dollar growth including cash flows — distorted by deposits/withdrawals",
+        "- **TWR** links daily returns; closer to \"pure investment performance\" but still assumes no explicit cash flow tracking",
+        "- **Alpha vs VN-Index** > 0 means you beat the market; < 0 means index would've done better (consider indexing)",
+        "- **Sharpe > 1** is good, > 2 is excellent for retail — but needs 6+ months of data to be meaningful",
+        f"- Snapshots stored in `.portfolio_snapshots.json` — currently {len(snapshots)} points, need 60+ for stable Sharpe",
+    ]
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+@register_tool(
+    name='get_sector_rotation',
+    description='Compute VN sector rotation: equal-weighted sector returns over 1M / 3M / 6M / YTD for ~10 sectors (Banking, Real Estate, Technology, Steel/Materials, Consumer Staples, Retail, Aviation, Industrial, Energy, Telecom). Ranks sectors by relative strength vs VN-Index (alpha). Identifies leaders, laggards, and whether cyclicals or defensives are leading — foundation for market cycle positioning.',
+    input_schema={'type': 'object', 'properties': {'rank_by': {'type': 'string', 'enum': ['1M', '3M', '6M', 'YTD'], 'default': '3M', 'description': "Which period's RS to rank by (default 3M)."}}, 'required': []},
+)
+async def _get_sector_rotation(args: dict) -> list[types.TextContent]:
+    rank_by = args.get("rank_by", "3M")
+    if rank_by not in {"1M", "3M", "6M", "YTD"}:
+        rank_by = "3M"
+
+    all_tickers = sorted({t for tickers in _VN_SECTORS.values() for t in tickers} | {"VNINDEX"})
+    histories = await asyncio.gather(*[
+        _vnstock_subprocess("quote_history_full", {"ticker": t, "days": 220})
+        for t in all_tickers
+    ])
+    hist_map = {t: _parse_price_series(h) for t, h in zip(all_tickers, histories)}
+
+    vn_series = hist_map.get("VNINDEX", [])
+    if not vn_series:
+        return [types.TextContent(
+            type="text",
+            text="Failed to fetch VN-Index data — cannot compute sector rotation without benchmark."
+        )]
+
+    def _period_lookup(days_back: int, is_ytd: bool):
+        return (lambda s: _ytd_return(s)) if is_ytd else (lambda s: period_return_from_series(s, days_back))
+
+    period_config: list[tuple[str, callable]] = [
+        ("1M",  _period_lookup(21, False)),
+        ("3M",  _period_lookup(63, False)),
+        ("6M",  _period_lookup(126, False)),
+        ("YTD", _period_lookup(0, True)),
+    ]
+
+    # VN-Index returns per period
+    vn_returns = {label: fn(vn_series) for label, fn in period_config}
+
+    # Sector aggregate returns per period (equal-weighted mean of member tickers)
+    sector_returns: dict[str, dict[str, float | None]] = {}
+    # Also keep per-ticker returns so we can surface top individuals within each sector
+    ticker_returns: dict[str, dict[str, float | None]] = {}  # {ticker: {"1M": ret, ...}}
+    ticker_sector: dict[str, str] = {}
+    for sector, tickers in _VN_SECTORS.items():
+        period_map: dict[str, float | None] = {}
+        for label, fn in period_config:
+            rets = [fn(hist_map.get(t, [])) for t in tickers]
+            rets_valid = [r for r in rets if r is not None]
+            period_map[label] = sum(rets_valid) / len(rets_valid) if rets_valid else None
+        sector_returns[sector] = period_map
+        for t in tickers:
+            ticker_sector[t] = sector
+            ticker_returns[t] = {label: fn(hist_map.get(t, [])) for label, fn in period_config}
+
+    # Relative strength = sector − VN-Index
+    def rs(sector: str, period: str) -> float | None:
+        s = sector_returns[sector].get(period)
+        v = vn_returns.get(period)
+        return (s - v) if s is not None and v is not None else None
+
+    ranked = sorted(
+        _VN_SECTORS.keys(),
+        key=lambda s: rs(s, rank_by) if rs(s, rank_by) is not None else -999,
+        reverse=True,
+    )
+
+    # ── Cyclical vs Defensive leadership ─────────────────────────────
+    top3 = ranked[:3]
+    bottom3 = ranked[-3:]
+    top3_cyclical = sum(1 for s in top3 if s in _CYCLICAL_SECTORS)
+    top3_defensive = sum(1 for s in top3 if s in _DEFENSIVE_SECTORS)
+    if top3_cyclical >= 2:
+        leadership = "🟢 CYCLICAL leadership"
+        leadership_note = "risk-on, credit expansion typically underway"
+    elif top3_defensive >= 2:
+        leadership = "🔴 DEFENSIVE leadership"
+        leadership_note = "risk-off, capital preservation regime"
+    else:
+        leadership = "⚪ MIXED leadership"
+        leadership_note = "rotation in progress, no clear regime"
+
+    # ── Render ────────────────────────────────────────────────────────
+    lines = [
+        "## VN Sector Rotation",
+        f"*Ranked by **{rank_by} relative strength** vs VN-Index. "
+        f"Equal-weighted returns across {sum(len(v) for v in _VN_SECTORS.values())} tickers "
+        f"in {len(_VN_SECTORS)} sectors.*",
+        "",
+        f"**Leadership regime: {leadership}** — {leadership_note}",
+        f"*Top 3: {', '.join(top3)} · Bottom 3: {', '.join(bottom3)}*",
+        "",
+        "### Sector Returns vs VN-Index",
+        "| Rank | Sector | 1M | 3M | 6M | YTD | Type |",
+        "|---|---|---:|---:|---:|---:|---|",
+    ]
+    for i, sector in enumerate(ranked, 1):
+        cells = []
+        for label, _ in period_config:
+            s_ret = sector_returns[sector].get(label)
+            v_ret = vn_returns.get(label)
+            if s_ret is None:
+                cells.append("—")
+            elif v_ret is None:
+                cells.append(f"{s_ret*100:+.1f}%")
+            else:
+                alpha = (s_ret - v_ret) * 100
+                icon = "🟢" if alpha > 3 else "🔴" if alpha < -3 else ""
+                cells.append(f"{s_ret*100:+.1f}% ({alpha:+.1f}pp) {icon}")
+        sector_type = "cyclical" if sector in _CYCLICAL_SECTORS else "defensive" if sector in _DEFENSIVE_SECTORS else "mixed"
+        lines.append(f"| {i} | **{sector}** | {cells[0]} | {cells[1]} | {cells[2]} | {cells[3]} | {sector_type} |")
+
+    # VN-Index benchmark row
+    lines.append(
+        f"| — | *VN-Index* | "
+        f"{vn_returns['1M']*100:+.1f}% | " if vn_returns['1M'] is not None else "| — | *VN-Index* | — |"
+    )
+    # Actually build proper row
+    lines[-1] = "| — | *VN-Index (benchmark)* | " + " | ".join(
+        f"{vn_returns[p]*100:+.1f}%" if vn_returns[p] is not None else "—"
+        for p, _ in period_config
+    ) + " | — |"
+
+    # ── Top tickers per leading sector ────────────────────────────────
+    lines += [
+        "",
+        f"### Top Tickers per Leading Sector (by {rank_by} return)",
+        "*Individual tickers driving the sector performance — these are your candidates for Stock Selection (Tier 4).*",
+        "",
+    ]
+    for sector in top3:
+        sector_tickers = _VN_SECTORS.get(sector, [])
+        # Rank tickers by chosen period, filter out None
+        ranked_tickers = sorted(
+            [(t, ticker_returns[t].get(rank_by)) for t in sector_tickers if ticker_returns[t].get(rank_by) is not None],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        if not ranked_tickers:
+            continue
+        vn_ret = vn_returns.get(rank_by)
+        lines.append(f"**{sector}** ({sector_returns[sector].get(rank_by, 0)*100:+.1f}% {rank_by} sector avg)")
+        lines.append("")
+        lines.append("| Ticker | 1M | 3M | 6M | YTD | Alpha vs VNI |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
+        for t, _ret in ranked_tickers[:5]:  # top 5 per sector
+            ret_by_p = ticker_returns[t]
+            cells = []
+            for p, _ in period_config:
+                r = ret_by_p.get(p)
+                cells.append(f"{r*100:+.1f}%" if r is not None else "—")
+            r_focus = ret_by_p.get(rank_by)
+            alpha = (r_focus - vn_ret) * 100 if r_focus is not None and vn_ret is not None else None
+            alpha_str = f"{alpha:+.1f}pp" if alpha is not None else "—"
+            lines.append(f"| **{t}** | {cells[0]} | {cells[1]} | {cells[2]} | {cells[3]} | {alpha_str} |")
+        lines.append("")
+
+    lines += [
+        "### How to read",
+        "- **Cyclical leadership** = investors are risk-on, betting on credit expansion (banks/real estate/materials/retail leading)",
+        "- **Defensive leadership** = risk-off, hiding in earnings stability (staples/telecom leading)",
+        "- **Relative strength (alpha)**: sector return minus VN-Index return. Positive = outperforming market",
+        "- **Rotation signal**: when cyclicals start leading after defensive regime, historical entry point for VN bull markets",
+        "- **Top tickers per sector** are your Tier 4 candidates — deep-dive them with `get_quality_score` + `get_dcf_valuation` + `get_technical_analysis`",
+        "- Combine with `get_money_supply` (credit direction) and `get_market_cycle` (phase classification)",
+    ]
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+async def _get_top_tickers_by_sector(args: dict) -> dict:
+    """Structured (non-MCP) helper: returns top-N tickers per top-M sectors by chosen period.
+
+    Returns: {rank_by, vni_return, sectors: [{name, sector_return, alpha_vs_vni, type, tickers: [{ticker, returns_by_period, alpha_vs_vni}]}]}
+    """
+    rank_by = args.get("rank_by", "3M")
+    if rank_by not in {"1M", "3M", "6M", "YTD"}:
+        rank_by = "3M"
+    top_sectors_n = int(args.get("top_sectors", 3))
+    top_tickers_n = int(args.get("top_tickers", 5))
+
+    all_tickers = sorted({t for tickers in _VN_SECTORS.values() for t in tickers} | {"VNINDEX"})
+    histories = await asyncio.gather(*[
+        _vnstock_subprocess("quote_history_full", {"ticker": t, "days": 220})
+        for t in all_tickers
+    ])
+    hist_map = {t: _parse_price_series(h) for t, h in zip(all_tickers, histories)}
+    vn_series = hist_map.get("VNINDEX", [])
+    if not vn_series:
+        return {"error": "VN-Index data unavailable"}
+
+    def _fn(days: int, is_ytd: bool):
+        return (lambda s: _ytd_return(s)) if is_ytd else (lambda s: period_return_from_series(s, days))
+
+    period_map = {"1M": _fn(21, False), "3M": _fn(63, False), "6M": _fn(126, False), "YTD": _fn(0, True)}
+    vni_returns = {p: fn(vn_series) for p, fn in period_map.items()}
+    vni_focus = vni_returns[rank_by]
+
+    sector_scores: list[tuple[str, float, dict[str, float]]] = []  # (sector, focus_ret, all_period_returns)
+    per_sector_tickers: dict[str, list[dict]] = {}
+
+    for sector, tickers in _VN_SECTORS.items():
+        rets_by_ticker: list[tuple[str, dict[str, float]]] = []
+        for t in tickers:
+            ticker_rets = {p: fn(hist_map.get(t, [])) for p, fn in period_map.items()}
+            if ticker_rets.get(rank_by) is not None:
+                rets_by_ticker.append((t, ticker_rets))
+        if not rets_by_ticker:
+            continue
+        # Sector average by chosen period
+        avg_focus = sum(r[1][rank_by] for r in rets_by_ticker) / len(rets_by_ticker)
+        # Full sector avg by period
+        sector_avg_by_period: dict[str, float] = {}
+        for p in period_map:
+            vals = [r[1][p] for r in rets_by_ticker if r[1].get(p) is not None]
+            if vals:
+                sector_avg_by_period[p] = sum(vals) / len(vals)
+        sector_scores.append((sector, avg_focus, sector_avg_by_period))
+
+        # Top N tickers within sector, ranked by focus period
+        sorted_ticks = sorted(rets_by_ticker, key=lambda x: x[1][rank_by], reverse=True)[:top_tickers_n]
+        per_sector_tickers[sector] = [
+            {
+                "ticker": t,
+                "returns": {p: (round(v * 100, 2) if v is not None else None) for p, v in rets.items()},
+                "alpha_vs_vni": (round((rets[rank_by] - vni_focus) * 100, 2) if vni_focus is not None else None),
+            }
+            for t, rets in sorted_ticks
+        ]
+
+    # Rank sectors by chosen period
+    sector_scores.sort(key=lambda x: x[1], reverse=True)
+    top_sectors = sector_scores[:top_sectors_n]
+
+    result = {
+        "rank_by": rank_by,
+        "vni_returns": {p: (round(v * 100, 2) if v is not None else None) for p, v in vni_returns.items()},
+        "sectors": [
+            {
+                "name": name,
+                "sector_returns": {p: (round(v * 100, 2) if v is not None else None) for p, v in per_period.items()},
+                "alpha_vs_vni": (round((focus - vni_focus) * 100, 2) if vni_focus is not None else None),
+                "type": "cyclical" if name in _CYCLICAL_SECTORS else "defensive" if name in _DEFENSIVE_SECTORS else "mixed",
+                "tickers": per_sector_tickers.get(name, []),
+            }
+            for name, focus, per_period in top_sectors
+        ],
+    }
+    return result
+
+
+@register_tool(
+    name='get_market_cycle',
+    description='Classify VN market cycle phase by combining credit conditions, VN-Index trend, and sector leadership. Returns one of 8 phases (Bottom / Early Recovery / Mid Expansion / Late Cycle / Peak / Distribution / Bear / Stabilization) with recommended sector positioning. Uses `get_money_supply` credit signal + VNINDEX MA200 trend + sector rotation leadership.',
+    input_schema={'type': 'object', 'properties': {}, 'required': []},
+)
+async def _get_market_cycle(_args: dict) -> list[types.TextContent]:
+    # ── 1. Credit signal: reuse top-5 banks aggregate ────────────────────
+    bank_annual = await asyncio.gather(*[_fetch_bank_loan_series(t, "year") for t in _M2_BANKS])
+    bank_map = dict(zip(_M2_BANKS, bank_annual))
+    all_periods: set[str] = set()
+    for s in bank_map.values():
+        all_periods.update(s.keys())
+    periods_sorted = sorted(all_periods, reverse=True)
+    aggregates: list[tuple[str, float]] = []
+    for p in periods_sorted:
+        total = sum(s.get(p, 0) for s in bank_map.values() if s.get(p))
+        if total > 0:
+            aggregates.append((p, total))
+    credit_yoy: float | None = None
+    if len(aggregates) >= 2 and aggregates[1][1] > 0:
+        credit_yoy = (aggregates[0][1] / aggregates[1][1] - 1) * 100
+    credit_state = "LOOSE" if credit_yoy is not None and credit_yoy > 15 else \
+                    "TIGHT" if credit_yoy is not None and credit_yoy < 10 else \
+                    "NEUTRAL"
+
+    # ── 2. VN-Index trend: price vs MA200 ─────────────────────────────
+    vn_raw = await _vnstock_subprocess("quote_history_full", {"ticker": "VNINDEX", "days": 400})
+    vn_series = _parse_price_series(vn_raw)
+    trend_state = "UNKNOWN"
+    vn_last: float | None = None
+    ma200: float | None = None
+    if len(vn_series) >= 200:
+        closes = [c for _, c in vn_series]
+        vn_last = closes[-1]
+        ma200 = sum(closes[-200:]) / 200
+        trend_state = "BULL" if vn_last > ma200 else "BEAR"
+
+    # ── 3. Sector leadership: fetch quickly, compute 3M RS ────────────
+    all_sector_tickers = sorted({t for ts in _VN_SECTORS.values() for t in ts})
+    hists = await asyncio.gather(*[
+        _vnstock_subprocess("quote_history_full", {"ticker": t, "days": 90})
+        for t in all_sector_tickers
+    ])
+    hist_map = {t: _parse_price_series(h) for t, h in zip(all_sector_tickers, hists)}
+
+    def _sector_3m_ret(tickers: list[str]) -> float | None:
+        rets = [period_return_from_series(hist_map.get(t, []), 63) for t in tickers]
+        rets = [r for r in rets if r is not None]
+        return sum(rets) / len(rets) if rets else None
+
+    sector_3m = {s: _sector_3m_ret(ts) for s, ts in _VN_SECTORS.items()}
+    ranked = sorted(sector_3m.items(), key=lambda x: x[1] if x[1] is not None else -999, reverse=True)
+    top3 = [s for s, _ in ranked[:3]]
+    cyclical_count = sum(1 for s in top3 if s in _CYCLICAL_SECTORS)
+    defensive_count = sum(1 for s in top3 if s in _DEFENSIVE_SECTORS)
+    if cyclical_count >= 2:
+        leadership = "CYCLICAL"
+    elif defensive_count >= 2:
+        leadership = "DEFENSIVE"
+    else:
+        leadership = "MIXED"
+
+    # ── 4. Classify phase (8-phase framework) ─────────────────────────
+    phase_map: dict[tuple[str, str, str], tuple[str, str, str]] = {
+        # (credit, trend, leadership) -> (phase, color, positioning)
+        ("LOOSE", "BULL", "CYCLICAL"):
+            ("MID EXPANSION", "🟢",
+             "Fully invested. Overweight cyclicals (banks, real estate, materials). Ride the trend."),
+        ("LOOSE", "BULL", "DEFENSIVE"):
+            ("EARLY RECOVERY", "🟡",
+             "Rotation incomplete. Contrarian bet on cyclicals often works — take starter positions."),
+        ("LOOSE", "BULL", "MIXED"):
+            ("EARLY EXPANSION", "🟢",
+             "Momentum building. Add to cyclical leaders, keep some cash for pullbacks."),
+        ("LOOSE", "BEAR", "CYCLICAL"):
+            ("BOTTOM", "🟢",
+             "Credit turning + cyclicals leading despite bear = major turnaround. High-conviction long entry."),
+        ("LOOSE", "BEAR", "DEFENSIVE"):
+            ("STABILIZATION", "🟡",
+             "Credit improving but market lagging. Wait for cyclical breakout before adding equity risk."),
+        ("LOOSE", "BEAR", "MIXED"):
+            ("STABILIZATION", "🟡",
+             "Credit improving but market mixed. Wait for clearer cyclical leadership."),
+        ("TIGHT", "BULL", "CYCLICAL"):
+            ("LATE CYCLE", "🟠",
+             "Dangerous — cyclicals leading with tightening credit. Trim positions, raise cash to 20-30%."),
+        ("TIGHT", "BULL", "DEFENSIVE"):
+            ("DISTRIBUTION", "🔴",
+             "Peak forming. Rotate aggressively to staples/telecom. Raise cash to 40%+."),
+        ("TIGHT", "BULL", "MIXED"):
+            ("LATE CYCLE", "🟠",
+             "Trend still up but credit tight — leadership rotation coming. Reduce risk."),
+        ("TIGHT", "BEAR", "CYCLICAL"):
+            ("DECLINE", "🔴",
+             "Early bear — cyclicals still leading but trend broken. Cut equity to 30-40%."),
+        ("TIGHT", "BEAR", "DEFENSIVE"):
+            ("BEAR", "🔴",
+             "Capital preservation. 50%+ cash, defensives only, no cyclical exposure."),
+        ("TIGHT", "BEAR", "MIXED"):
+            ("BEAR", "🔴",
+             "Capital preservation. 50%+ cash. Wait for credit to loosen before deploying."),
+        ("NEUTRAL", "BULL", "CYCLICAL"):
+            ("MID EXPANSION", "🟡",
+             "Credit not decisively loose. Stay invested but avoid leverage."),
+        ("NEUTRAL", "BULL", "DEFENSIVE"):
+            ("TRANSITION", "🟡",
+             "Late-cycle behavior emerging. Rotate half of cyclical exposure to defensives."),
+        ("NEUTRAL", "BEAR", "CYCLICAL"):
+            ("STABILIZATION", "🟡",
+             "Bear market rally likely. Wait for credit signal before adding risk."),
+        ("NEUTRAL", "BEAR", "DEFENSIVE"):
+            ("BEAR", "🟠",
+             "Defensive positioning. Cash 40%, defensives, wait for credit loosening."),
+    }
+    key = (credit_state, trend_state, leadership)
+    phase, color, positioning = phase_map.get(key, ("UNKNOWN", "⚪", "Insufficient signal to classify."))
+
+    # ── Render ────────────────────────────────────────────────────────
+    # Individual signal explanations
+    if credit_state == "LOOSE":
+        credit_read = f"🟢 **LOOSE** — banks lending aggressively (>15% YoY). This puts new money into the economy which flows to asset prices. Historically preceded 2016-18 and 2020-21 VN bull markets."
+    elif credit_state == "TIGHT":
+        credit_read = f"🔴 **TIGHT** — banks lending cautiously (<10% YoY). Money leaves risk assets. Historically preceded 2018 correction and 2022 bear."
+    else:
+        credit_read = f"⚪ **NEUTRAL** — banks lending moderately (10-15% YoY). No decisive signal. Wait for clearer direction."
+
+    if trend_state == "BULL":
+        trend_read = f"🟢 **BULL** — VN-Index above its 200-day moving average (a smoothed average of ~10 months of closing prices). Institutional consensus is buyers > sellers on a longer horizon. Historically, staying long above MA200 captures most of VN market's gains."
+    elif trend_state == "BEAR":
+        trend_read = f"🔴 **BEAR** — VN-Index below its 200-day moving average. Institutional consensus is sellers > buyers. Historically, staying long below MA200 leads to drawdowns."
+    else:
+        trend_read = "⚪ **UNKNOWN** — insufficient price history to compute MA200."
+
+    if leadership == "CYCLICAL":
+        lead_read = (
+            f"🟢 **CYCLICAL leadership** — Banks / Real Estate / Materials / Retail / Aviation among top-3 sectors. "
+            f"Investors are risk-on, betting on economic expansion. This is what you WANT to see in a bull market. "
+            f"Top 3: {', '.join(top3)}."
+        )
+    elif leadership == "DEFENSIVE":
+        lead_read = (
+            f"🔴 **DEFENSIVE leadership** — Consumer Staples / Telecom / Utilities among top-3. "
+            f"Investors hiding in stable earnings, avoiding cyclical risk. This precedes or accompanies market weakness. "
+            f"Top 3: {', '.join(top3)}."
+        )
+    else:
+        lead_read = f"🟡 **MIXED leadership** — no clear cyclical or defensive tilt. Rotation in progress. Top 3: {', '.join(top3)}."
+
+    # Positioning implications
+    def _cash_range_from_phase(p: str) -> str:
+        return {
+            "MID EXPANSION": "5-15% cash. Fully invested with a small dry-powder reserve.",
+            "EARLY RECOVERY": "15-25% cash. Take starter positions in cyclicals; don't fully deploy.",
+            "EARLY EXPANSION": "10-20% cash. Add to cyclical leaders on pullbacks.",
+            "BOTTOM": "5-15% cash. High-conviction long entry — this is where multi-year gains start.",
+            "STABILIZATION": "30-40% cash. Wait for confirmation before deploying.",
+            "LATE CYCLE": "25-35% cash. Rotate half of cyclical exposure to defensives.",
+            "DISTRIBUTION": "40-50% cash. Aggressive rotation to defensives.",
+            "TRANSITION": "25-35% cash. Half cyclical / half defensive.",
+            "DECLINE": "50-60% cash. Cut cyclical exposure sharply.",
+            "BEAR": "50-70% cash. Defensives only. Wait for credit to loosen.",
+        }.get(p, "Depends on your risk tolerance.")
+
+    sector_moves = {
+        "MID EXPANSION": "Overweight: Banks, Real Estate, Materials, Retail. Underweight: Staples, Telecom.",
+        "EARLY RECOVERY": "Rotate: Staples/Telecom → Banks/Materials. Small starter positions in beaten-down cyclicals.",
+        "EARLY EXPANSION": "Overweight: cyclical leaders showing strongest RS (see `get_sector_rotation`). Add on 3-5% pullbacks.",
+        "BOTTOM": "Buy: Banks, Real Estate, quality cyclicals with strong balance sheets. Skip: high-debt turnarounds until confirmed.",
+        "STABILIZATION": "Hold: existing quality positions. Do not add new cyclical exposure yet.",
+        "LATE CYCLE": "Trim: your best-performing cyclicals (they'll drop first). Add: defensive dividend payers.",
+        "DISTRIBUTION": "Sell: cyclicals aggressively. Buy: Consumer Staples (VNM, SAB, MSN), Telecom (VGI, CTR).",
+        "TRANSITION": "Rebalance: 50/50 cyclical/defensive. Take profits on winners.",
+        "DECLINE": "Sell: any cyclical still in green. Add: only defensive names showing relative strength.",
+        "BEAR": "Hold: cash + short-duration bonds + defensive dividends. No cyclicals.",
+    }
+    sector_moves_line = sector_moves.get(phase, "Follow the positioning line above.")
+
+    lines = [
+        f"## VN Market Cycle Phase: {color} **{phase}**",
+        "",
+        "> **How this framework works**: In VN market (and globally), 3 signals — credit conditions,",
+        "> index trend, and sector leadership — combine to describe where we are in the cycle.",
+        "> Each phase implies a **specific portfolio posture** (cash %, cyclical vs defensive tilt).",
+        "> Read each section below to understand WHY the framework says what it says.",
+        "",
+        "---",
+        "",
+        "### 📊 SIGNAL 1 — Credit Conditions",
+        "",
+        "**What it measures**: Are Vietnam's largest 5 banks (VCB/BID/CTG/TCB/MBB) growing their loan books aggressively (loose credit)",
+        "or cautiously (tight credit)? Loans are the mechanism by which new money enters the economy.",
+        "",
+        "**Why it matters**: In VN, credit growth **leads M2 growth** by 1-2 quarters, and M2 growth **leads asset prices**.",
+        "So bank credit YoY is one of the earliest signals for market direction. SBV sets an annual credit growth target",
+        "(historically 14-15%) — banks hitting the cap = liquidity being pumped into economy.",
+        "",
+        f"**Current reading**: {credit_read}",
+        f"- Metric: Top-5 bank aggregate loans YoY = **{f'{credit_yoy:+.2f}%' if credit_yoy is not None else '—'}**",
+        f"- Thresholds: >15% = LOOSE (bullish), 10-15% = NEUTRAL, <10% = TIGHT (bearish)",
+        "",
+        "---",
+        "",
+        "### 📈 SIGNAL 2 — VN-Index Trend",
+        "",
+        "**What it measures**: Is the VN-Index above or below its 200-day moving average (MA200)?",
+        "MA200 = the average of the last 200 daily closes ≈ 10 months of price data.",
+        "",
+        "**Why it matters**: MA200 is a **regime filter** used by institutional investors globally. It smooths out",
+        "short-term noise. Above MA200 = uptrend intact, participants are buying dips. Below MA200 = downtrend,",
+        "participants are selling rallies. Historically 80%+ of VN market gains happen while VNINDEX > MA200.",
+        "",
+        f"**Current reading**: {trend_read}",
+    ]
+    if vn_last is not None and ma200 is not None:
+        gap_pct = (vn_last - ma200) / ma200 * 100
+        lines.append(f"- VN-Index: **{vn_last:,.1f}** vs MA200: **{ma200:,.1f}** → gap **{gap_pct:+.1f}%**")
+    lines += [
+        "- Interpretation: above MA200 by >2% = strong bull, within ±2% = uncertain/whipsaw, below by >2% = strong bear",
+        "",
+        "---",
+        "",
+        "### 🎯 SIGNAL 3 — Sector Leadership",
+        "",
+        "**What it measures**: Which sectors are leading over the last 3 months? We split VN sectors into two groups:",
+        "- **Cyclical**: Banks, Real Estate, Steel/Materials, Retail, Aviation, Industrial, Energy — profits depend on economic growth",
+        "- **Defensive**: Consumer Staples, Telecom — profits stable regardless of economy (people always buy food, use phones)",
+        "",
+        "**Why it matters**: When investors are OPTIMISTIC, they buy cyclicals (leveraged to growth). When PESSIMISTIC,",
+        "they hide in defensives. Leadership tells you the market's mood beyond just the index level. A rising market",
+        "led by defensives is FRAGILE; a rising market led by cyclicals is HEALTHY.",
+        "",
+        f"**Current reading**: {lead_read}",
+        f"- Rule: 2 of top-3 sectors cyclical → CYCLICAL, 2 of top-3 defensive → DEFENSIVE, otherwise MIXED",
+        "",
+        "---",
+        "",
+        "### 🧭 PHASE CLASSIFICATION",
+        "",
+        f"Combining the 3 signals → **{color} {phase}**",
+        "",
+        "**Full framework table** (bold shows current phase):",
+        "",
+        "| Credit | Trend | Leadership | Phase | Interpretation |",
+        "|---|---|---|---|---|",
+    ]
+
+    phase_rows = [
+        (("LOOSE", "BULL", "CYCLICAL"), "🟢 Mid Expansion", "Ride the trend. Fully invested."),
+        (("LOOSE", "BULL", "DEFENSIVE"), "🟡 Early Recovery", "Contrarian — rotate to cyclicals early."),
+        (("LOOSE", "BULL", "MIXED"), "🟢 Early Expansion", "Momentum building. Add to leaders."),
+        (("LOOSE", "BEAR", "CYCLICAL"), "🟢 Bottom", "High-conviction long entry. Multi-year gains often start here."),
+        (("LOOSE", "BEAR", "DEFENSIVE"), "🟡 Stabilization", "Credit turning but market lagging — wait."),
+        (("LOOSE", "BEAR", "MIXED"), "🟡 Stabilization", "Wait for clearer leadership."),
+        (("TIGHT", "BULL", "CYCLICAL"), "🟠 Late Cycle", "Dangerous. Trim positions, raise cash."),
+        (("TIGHT", "BULL", "DEFENSIVE"), "🔴 Distribution", "Peak forming. Aggressive rotation to defensives."),
+        (("TIGHT", "BULL", "MIXED"), "🟠 Late Cycle", "Reduce risk."),
+        (("TIGHT", "BEAR", "CYCLICAL"), "🔴 Decline", "Early bear. Cut cyclicals sharply."),
+        (("TIGHT", "BEAR", "DEFENSIVE"), "🔴 Bear", "Capital preservation. 50%+ cash."),
+        (("TIGHT", "BEAR", "MIXED"), "🔴 Bear", "Capital preservation. Wait for credit loosening."),
+        (("NEUTRAL", "BULL", "CYCLICAL"), "🟡 Mid Expansion*", "Stay invested but no leverage."),
+        (("NEUTRAL", "BULL", "DEFENSIVE"), "🟡 Transition", "Rotate half cyclical → defensive."),
+        (("NEUTRAL", "BEAR", "CYCLICAL"), "🟡 Stabilization", "Bear rally likely; wait."),
+        (("NEUTRAL", "BEAR", "DEFENSIVE"), "🟠 Bear", "Defensive positioning."),
+    ]
+    for row_key, name, interp in phase_rows:
+        c, t, l = row_key
+        is_current = row_key == key
+        row_str = f"| {'**' if is_current else ''}{c.title()}{'**' if is_current else ''} | {'**' if is_current else ''}{t.title()}{'**' if is_current else ''} | {'**' if is_current else ''}{l.title()}{'**' if is_current else ''} | {'**' if is_current else ''}{name}{'**' if is_current else ''} | {'👉 ' if is_current else ''}{interp} |"
+        lines.append(row_str)
+
+    lines += [
+        "",
+        "---",
+        "",
+        "### 💼 POSITIONING RECOMMENDATION",
+        "",
+        f"**{positioning}**",
+        "",
+        f"**Suggested cash range**: {_cash_range_from_phase(phase)}",
+        "",
+        f"**Sector moves**: {sector_moves_line}",
+        "",
+        "**How to execute**:",
+        "1. Check your current portfolio at `/portfolio` — is your cash/equity mix aligned with this phase?",
+        "2. If overweight cyclicals in a DISTRIBUTION/BEAR phase → trim aggressively.",
+        "3. If underweight cyclicals in a BOTTOM/EARLY RECOVERY → deploy cash into leading sectors from `get_sector_rotation`.",
+        "4. Do NOT flip 100% based on one reading. Confirm with 2-3 weeks of consistent signals before major moves.",
+        "",
+        "---",
+        "",
+        "### ⚠️ LIMITATIONS & CAVEATS",
+        "",
+        "- **Single-signal model**: Real cycles have false transitions. Signals often disagree for weeks before resolving.",
+        "- **Lookback**: MA200 needs 200+ trading days of data. Sector RS needs ≥3 months per sector.",
+        "- **Credit is annual proxy**: Uses top-5 banks — smaller banks and non-bank credit not captured.",
+        "- **VN-specific**: Framework calibrated for VN market's cyclical structure. Not directly applicable to other emerging markets.",
+        "- **Confirmation bias risk**: If your current portfolio matches the recommended phase, don't just nod — re-check whether you'd take these actions if starting fresh.",
+        "",
+        "**Best practice**: Run this weekly. Note the phase in your journal. Only act on transitions after 2-3 weeks of consistent readings.",
+    ]
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+_MACRO_KEY_METRIC_PATTERNS = [
+    ("GDP",           [r"GDP.{0,40}?[0-9]+[.,][0-9]+\s*%", r"tăng trưởng.{0,30}?[0-9]+[.,][0-9]+\s*%"]),
+    ("CPI",           [r"CPI.{0,40}?[0-9]+[.,][0-9]+\s*%", r"lạm phát.{0,30}?[0-9]+[.,][0-9]+\s*%"]),
+    ("M2 / credit",   [r"M2.{0,40}?[0-9]+[.,][0-9]+\s*%", r"tín dụng.{0,40}?[0-9]+[.,][0-9]+\s*%", r"credit growth.{0,40}?[0-9]+[.,][0-9]+\s*%"]),
+    ("Interest rate", [r"lãi suất.{0,40}?[0-9]+[.,][0-9]+\s*%", r"policy rate.{0,40}?[0-9]+[.,][0-9]+\s*%"]),
+    ("USD/VND",       [r"USD/VND.{0,20}?[0-9][0-9,\.]+", r"tỷ giá.{0,30}?[0-9][0-9,\.]+"]),
+    ("FDI",           [r"FDI.{0,40}?[0-9][0-9,\.]+\s*(tỷ|billion|USD)"]),
+    ("Trade",         [r"xuất khẩu.{0,40}?[0-9][0-9,\.]+\s*(tỷ|billion|USD)", r"cán cân.{0,30}?[0-9][0-9,\.]+"]),
+]
+
+
+def _extract_macro_highlights(text: str, max_per_metric: int = 3) -> dict[str, list[str]]:
+    import re
+    highlights: dict[str, list[str]] = {}
+    for label, patterns in _MACRO_KEY_METRIC_PATTERNS:
+        matches: list[str] = []
+        for pat in patterns:
+            for m in re.finditer(pat, text, flags=re.IGNORECASE):
+                snippet = m.group(0).strip()
+                if snippet not in matches:
+                    matches.append(snippet)
+                if len(matches) >= max_per_metric:
+                    break
+            if len(matches) >= max_per_metric:
+                break
+        if matches:
+            highlights[label] = matches
+    return highlights
+
+
+def _detect_report_sections(text: str) -> list[str]:
+    """Best-effort: return headings that look like macro-report sections."""
+    import re
+    section_keywords = [
+        "kinh tế vĩ mô", "vĩ mô", "GDP", "lạm phát", "CPI", "tỷ giá", "lãi suất",
+        "tín dụng", "chính sách tiền tệ", "xuất khẩu", "nhập khẩu", "FDI",
+        "thị trường chứng khoán", "triển vọng", "khuyến nghị", "rủi ro",
+        "macro", "outlook", "monetary policy", "fiscal", "inflation",
+    ]
+    lines = text.split("\n")
+    hits: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        s = line.strip()
+        if not (6 < len(s) < 120):
+            continue
+        low = s.lower()
+        if any(kw in low for kw in section_keywords):
+            key = low
+            if key not in seen:
+                seen.add(key)
+                hits.append(s)
+        if len(hits) >= 15:
+            break
+    return hits
+
+
+@register_tool(
+    name='load_macro_report',
+    description='Load and read a Vietnam macro analysis report (broker macro PDF, SBV/GSO policy paper). Extracts text via pymupdf, returns a structured markdown preview showing detected sections and key numeric mentions (GDP/CPI/M2/exchange rate figures). Optionally saves to `knowledge/sources/macro/` for the knowledge base. For scanned PDFs with no text layer, use `load_financial_pdf` instead for visual reading.',
+    input_schema={'type': 'object', 'properties': {'source': {'type': 'string', 'description': 'HTTPS URL or local absolute path to the macro report PDF.'}, 'save': {'type': 'boolean', 'description': 'If true, ingest the extracted text into knowledge/sources/macro/ (default false).', 'default': False}, 'broker': {'type': 'string', 'description': "Broker/publisher name (e.g. 'SSI Research', 'VCBS', 'Mirae Asset', 'BVSC').", 'default': ''}, 'title': {'type': 'string', 'description': 'Report title override. If empty, extracted from PDF metadata.', 'default': ''}, 'language': {'type': 'string', 'enum': ['vi', 'en'], 'default': 'vi', 'description': 'Report language (default vi for Vietnamese broker reports).'}}, 'required': ['source']},
+)
+async def _load_macro_report(args: dict) -> list[types.TextContent]:
+    from pathlib import Path as _P
+    source: str = args["source"]
+    save: bool = bool(args.get("save", False))
+    broker: str = str(args.get("broker", "")).strip()
+    title_override: str = str(args.get("title", "")).strip()
+    language: str = str(args.get("language", "vi")).lower() or "vi"
+
+    # ── 1. Fetch bytes ───────────────────────────────────────────────
+    if source.startswith("http://") or source.startswith("https://"):
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+            try:
+                resp = await client.get(source)
+                resp.raise_for_status()
+                pdf_bytes = resp.content
+            except Exception as e:
+                return [types.TextContent(type="text", text=f"Failed to download {source}: {e}")]
+    else:
+        p = _P(source)
+        if not p.exists():
+            return [types.TextContent(type="text", text=f"File not found: {source}")]
+        pdf_bytes = p.read_bytes()
+
+    if not pdf_bytes:
+        return [types.TextContent(type="text", text="Empty PDF payload.")]
+
+    # ── 2. Extract text via pymupdf ──────────────────────────────────
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Failed to open PDF: {e}")]
+
+    page_count = doc.page_count
+    pages_text: list[str] = []
+    for page in doc:
+        pages_text.append(page.get_text("text"))
+    full_text = "\n\n".join(t.strip() for t in pages_text if t.strip())
+    doc.close()
+
+    if not full_text or len(full_text) < 200:
+        return [types.TextContent(type="text", text=(
+            f"PDF has {page_count} pages but only {len(full_text)} chars of extractable text — "
+            "likely a scanned/image-only report. Use `load_financial_pdf` for visual reading instead."
+        ))]
+
+    # ── 3. Infer title if not provided ───────────────────────────────
+    inferred_title = title_override
+    if not inferred_title:
+        first_lines = [ln.strip() for ln in full_text.split("\n")[:20] if 8 < len(ln.strip()) < 200]
+        inferred_title = first_lines[0] if first_lines else "Macro Report"
+
+    # ── 4. Extract highlights ────────────────────────────────────────
+    highlights = _extract_macro_highlights(full_text)
+    sections = _detect_report_sections(full_text)
+
+    # ── 5. Save to knowledge base if requested ───────────────────────
+    saved_path: str | None = None
+    if save:
+        try:
+            sys.path.insert(0, str(Path(__file__).parent))
+            from knowledge.pipelines._common import (
+                load_manifest, save_manifest, already_ingested, content_hash,
+                write_source, manifest_entry,
+            )
+            chash = content_hash(full_text)
+            manifest = load_manifest()
+            if already_ingested(manifest, chash):
+                saved_path = "(already in knowledge base — content hash match)"
+            else:
+                from datetime import date as _d
+                display_source = broker or "Macro Report"
+                sid, out_path = write_source(
+                    category="macro",
+                    source_name=display_source,
+                    title=inferred_title,
+                    body=full_text,
+                    pub_date=_d.today().isoformat(),
+                    language=language,
+                    doc_type="pdf",
+                    extra={"pages": page_count, "size_bytes": len(pdf_bytes)},
+                )
+                manifest["ingested"][sid] = manifest_entry(
+                    source_name=display_source,
+                    source_url=source if source.startswith("http") else "",
+                    url=source if source.startswith("http") else "",
+                    title=inferred_title,
+                    pub_date=_d.today().isoformat(),
+                    chash=chash,
+                    path=out_path,
+                    category="macro",
+                    doc_type="pdf",
+                )
+                save_manifest(manifest)
+                saved_path = str(out_path.relative_to(Path(__file__).parent))
+        except Exception as e:
+            saved_path = f"Save failed: {e}"
+
+    # ── 6. Build preview response ────────────────────────────────────
+    preview_len = 2500
+    text_preview = full_text[:preview_len]
+    if len(full_text) > preview_len:
+        text_preview += f"\n\n*... (truncated at {preview_len} chars; full text {len(full_text)} chars)*"
+
+    lines = [
+        f"## Macro Report Loaded",
+        f"**Title:** {inferred_title}",
+        f"**Source:** {broker or 'Unspecified'} · **Pages:** {page_count} · **Chars:** {len(full_text):,} · **Language:** {language}",
+    ]
+    if saved_path:
+        lines.append(f"**Saved to:** `{saved_path}`")
+    lines.append("")
+
+    if highlights:
+        lines += ["### Key Metric Mentions", ""]
+        for label, matches in highlights.items():
+            lines.append(f"- **{label}**: " + "; ".join(matches))
+    else:
+        lines.append("*No obvious macro metric patterns detected — read text below.*")
+
+    if sections:
+        lines += ["", "### Detected Section Headings", ""]
+        lines += [f"- {s}" for s in sections[:12]]
+
+    lines += [
+        "",
+        "### Text Preview",
+        "```",
+        text_preview,
+        "```",
+        "",
+        "### Next Steps",
+        "- Read the full text above and identify the report's stance on M2 / credit / rates / VND",
+        "- Cross-check quoted figures against `get_vn_macro_indicators` and `get_money_supply` for reconciliation",
+        "- If `save=true` was used, this report is now in the knowledge base — future `list_macro_reports` will surface it",
+    ]
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+_MASVN_MACRO_CAT_ID = 28
+
+
+@register_tool(
+    name='fetch_macro_reports',
+    description='Fetch the latest VN broker macro reports from public broker portals. Currently supports Mirae Asset Securities Vietnam (masvn) — their macro/strategy reports (Kinh tế Việt Nam, Triển vọng thị trường, Đánh giá xu hướng). Returns a list with title, date, PDF URL. Pair with `load_macro_report(source=<pdf_url>, save=true)` to ingest into the knowledge base.',
+    input_schema={'type': 'object', 'properties': {'broker': {'type': 'string', 'enum': ['masvn'], 'default': 'masvn', 'description': 'Broker source (currently only Mirae Asset supported).'}, 'limit': {'type': 'integer', 'default': 10, 'description': 'Max reports to return (default 10).'}}, 'required': []},
+)
+async def _fetch_macro_reports(args: dict) -> list[types.TextContent]:
+    broker = str(args.get("broker", "masvn")).lower()
+    limit = int(args.get("limit", 10))
+
+    if broker != "masvn":
+        return [types.TextContent(type="text", text=f"Broker '{broker}' not supported yet. Available: masvn (Mirae Asset).")]
+
+    url = (
+        f"https://masvn.com/api/categories/fe/{_MASVN_MACRO_CAT_ID}/article"
+        f"?paging=1&sort=published_at&direction=desc&active=1&page=1&limit={limit}"
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.masvn.com",
+    }
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Failed to fetch MASVN feed: {e}")]
+
+    def _parse_title(raw) -> dict:
+        if isinstance(raw, str):
+            try: return json.loads(raw)
+            except json.JSONDecodeError: return {"vi": raw}
+        return raw or {}
+
+    items = payload.get("data", [])
+    total = payload.get("total", 0)
+
+    if not items:
+        return [types.TextContent(type="text", text=f"No macro reports returned from Mirae Asset (total={total}).")]
+
+    lines = [
+        f"## Latest Macro Reports — Mirae Asset Securities Vietnam",
+        f"*Category id {_MASVN_MACRO_CAT_ID} · {total} total published · showing {min(len(items), limit)}*",
+        "",
+        "| Date | Title | PDF |",
+        "|---|---|---|",
+    ]
+    for item in items[:limit]:
+        title_obj = _parse_title(item.get("title", {}))
+        title_vi = title_obj.get("vi") or title_obj.get("en") or "(untitled)"
+        pub = str(item.get("published_at", ""))[:10]
+        file_path = item.get("file_path")
+        pdf_url = f"https://www.masvn.com{file_path}" if file_path else ""
+        pdf_cell = f"[Load]({pdf_url})" if pdf_url else "—"
+        lines.append(f"| {pub} | {title_vi[:90]} | {pdf_cell} |")
+
+    lines += [
+        "",
+        "### Next Steps",
+        "- Copy a PDF URL above and call `load_macro_report(source=<url>, save=true, broker='Mirae Asset', title=<title>)`",
+        "- Or use the `/macro` UI page's 'Fetch from broker' section for one-click load-and-save",
+        "",
+        "*Data source: masvn.com public API. Reports may require Vietnamese language capability to read.*",
+    ]
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+@register_tool(
+    name='list_macro_reports',
+    description='List macro reports saved in `knowledge/sources/macro/` — the persistent library of ingested Vietnam macro analyses. Returns metadata (title, broker, pub_date, path) sorted by ingestion date. Use to browse existing knowledge before requesting a fresh read.',
+    input_schema={'type': 'object', 'properties': {'limit': {'type': 'integer', 'default': 20, 'description': 'Max number of reports to return (default 20).'}}, 'required': []},
+)
+async def _list_macro_reports(args: dict) -> list[types.TextContent]:
+    limit = int(args.get("limit", 20))
+    macro_dir = Path(__file__).parent / "knowledge" / "sources" / "macro"
+    if not macro_dir.exists():
+        return [types.TextContent(
+            type="text",
+            text="No macro reports library yet. Load one with `load_macro_report(source=..., save=true)` to start."
+        )]
+
+    files = sorted(macro_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+    if not files:
+        return [types.TextContent(type="text", text="Macro library is empty. Use `load_macro_report(save=true)` to populate.")]
+
+    lines = [f"## Saved Macro Reports ({len(files)})", "", "| Date | Broker | Title | Path |", "|---|---|---|---|"]
+    for f in files:
+        try:
+            content = f.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        # Parse minimal frontmatter
+        meta: dict[str, str] = {}
+        if content.startswith("---"):
+            end = content.find("---", 3)
+            if end > 0:
+                for line in content[3:end].split("\n"):
+                    if ":" in line:
+                        k, _, v = line.partition(":")
+                        meta[k.strip()] = v.strip().strip('"')
+        title = meta.get("title", f.stem)[:60]
+        broker = meta.get("source_name") or meta.get("source", "—")
+        pub_date = meta.get("pub_date", "")[:10] or "—"
+        rel = f.relative_to(Path(__file__).parent)
+        lines.append(f"| {pub_date} | {broker} | {title} | `{rel}` |")
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
 
 
 async def main():

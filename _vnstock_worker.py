@@ -73,6 +73,16 @@ try:
             .cash_flow(period=kwargs.get("period", "year"), lang="en")
         )
 
+    elif func_name == "foreign_flow_history":
+        from datetime import date, timedelta
+        end = date.today().isoformat()
+        start = (date.today() - timedelta(days=kwargs.get("days", 90))).isoformat()
+        df = Quote(symbol=kwargs["ticker"], source="VCI").history(
+            start=start, end=end, interval="1D",
+        )
+        keep = [c for c in ["time", "close", "foreign_buy_volume", "foreign_sell_volume"] if c in df.columns]
+        result = _df_to_json(df[keep]) if keep else {"error": "foreign_buy_volume column not available from VCI"}
+
     elif func_name == "price_board":
         try:
             from vnstock import Trading

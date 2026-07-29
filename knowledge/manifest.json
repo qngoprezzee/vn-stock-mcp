@@ -2,10 +2,10 @@
   "version": 1,
   "last_run": "2026-06-04T15:24:25+07:00",
   "stats": {
-    "total_sources": 479,
+    "total_sources": 480,
     "by_type": {
       "article": 468,
-      "pdf": 7,
+      "pdf": 8,
       "blog": 3,
       "regulatory": 1
     }
@@ -5758,6 +5758,18 @@
       "category": "filings",
       "path": "knowledge/sources/filings/2026-06-05_vietnam-daily-report_bc334f3a.md",
       "ingested_at": "2026-06-05T17:29:46+07:00"
+    },
+    "mirae-asset-securities-vietnam_2026-07-10_cd35e621": {
+      "source": "Mirae Asset Securities Vietnam",
+      "source_url": "https://www.masvn.com/attachment/file/1783588706686-MASVN_Macro_2026_07_VN.pdf",
+      "url": "https://www.masvn.com/attachment/file/1783588706686-MASVN_Macro_2026_07_VN.pdf",
+      "title": "Kinh tế Việt Nam: Kiến tạo nền móng cho khát vọng 2045",
+      "pub_date": "2026-07-10",
+      "content_hash": "7ac2662aca64f60b",
+      "type": "pdf",
+      "category": "macro",
+      "path": "knowledge/sources/macro/2026-07-10_mirae-asset-securities-vietnam_cd35e621.md",
+      "ingested_at": "2026-07-10T09:58:59+07:00"
     }
   }
 }

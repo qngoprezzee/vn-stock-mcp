@@ -100,6 +100,42 @@ export const stockForeignFlow = (ticker: string) =>
 export const stockTechnical = (ticker: string) =>
   postJSON<TextResponse>("/api/stock/technical", { ticker });
 
+export const stockMoneyFlowPriceAction = (params: { ticker: string; days?: number }) =>
+  postJSON<TextResponse>("/api/stock/money-flow-price-action", params);
+
+export const fetchBrokerNews = (params: { ticker: string; limit?: number }) =>
+  postJSON<TextResponse>("/api/stock/broker-news", params);
+
+// ── Portfolio ────────────────────────────────────────────────────────────────
+
+export const portfolioManage = (params: {
+  action: "list" | "add" | "remove" | "set_cash" | "clear";
+  ticker?: string;
+  shares?: number;
+  avg_cost?: number;
+  target_weight?: number;
+  cash_vnd?: number;
+  notes?: string;
+}) => postJSON<TextResponse>("/api/portfolio/manage", params);
+
+export const portfolioOverview = () =>
+  getJSON<TextResponse>("/api/portfolio/overview");
+
+export const portfolioRisk = () =>
+  getJSON<TextResponse>("/api/portfolio/risk");
+
+export const portfolioRebalance = (params: { threshold_pct?: number }) =>
+  postJSON<TextResponse>("/api/portfolio/rebalance", params);
+
+export const portfolioRaw = () =>
+  getJSON<{ holdings: Array<{ ticker: string; shares: number; avg_cost: number; target_weight?: number; opened_at?: string; notes?: string }>; cash_vnd: number; peak_value: number; peak_date: string }>("/api/portfolio/raw");
+
+export const portfolioReturns = (params: { risk_free_rate?: number }) =>
+  postJSON<TextResponse>("/api/portfolio/returns", params);
+
+export const portfolioSnapshots = () =>
+  getJSON<{ snapshots: Array<{ date: string; total_value: number; equity_value: number; cash: number }> }>("/api/portfolio/snapshots");
+
 export const stockNewsCorrelation = (params: { ticker: string; lookback_days?: number }) =>
   postJSON<TextResponse>("/api/stock/news-correlation", params);
 
@@ -136,8 +172,176 @@ export const marketIndexChart = (index = "VNINDEX", days = 365) =>
 export const marketOverview = () => getJSON<TextResponse>("/api/market/overview");
 export const economyNews = (limit = 20) =>
   getJSON<TextResponse>(`/api/market/economy-news?limit=${limit}`);
+
+export type NewsArticle = {
+  source: string;
+  source_url: string;
+  title: string;
+  link: string;
+  date: string;
+  summary?: string;
+};
+
+export type NewsDataResponse = {
+  articles: NewsArticle[];
+  total: number;
+  sources_total: number;
+  generated_at: string;
+};
+
+export const marketNewsData = (limit = 50) =>
+  getJSON<NewsDataResponse>(`/api/market/news-data?limit=${limit}`);
+
+export type NewsDigestResponse = {
+  digest: string;
+  article_count: number;
+  sources_total: number;
+  generated_at: string;
+  model: string;
+};
+
+export const marketNewsDigest = (params: { limit?: number; force?: boolean } = {}) =>
+  postJSON<NewsDigestResponse>("/api/market/news-digest", params);
 export const macroData = () => getJSON<TextResponse>("/api/market/macro-data");
 export const macroIndicators = () => getJSON<TextResponse>("/api/market/macro-indicators");
+
+export const moneySupply = () => getJSON<TextResponse>("/api/market/money-supply");
+
+export type M2Observation = {
+  date: string;
+  value_trillion_vnd: number;
+  source?: string;
+  note?: string;
+};
+
+export const m2SeriesRaw = () =>
+  getJSON<{ observations: M2Observation[] }>("/api/market/m2-series/raw");
+
+export const m2SeriesManage = (params: {
+  action: "list" | "add" | "remove" | "clear";
+  date?: string;
+  value_trillion_vnd?: number;
+  source?: string;
+  note?: string;
+}) => postJSON<TextResponse>("/api/market/m2-series", params);
+
+export type CpiObservation = {
+  date: string;
+  cpi_yoy: number;
+  cpi_mom?: number | null;
+  source?: string;
+  note?: string;
+};
+
+export const cpiSeriesRaw = () =>
+  getJSON<{ observations: CpiObservation[] }>("/api/market/cpi-series/raw");
+
+export const cpiSeriesManage = (params: {
+  action: "list" | "add" | "remove" | "clear";
+  date?: string;
+  cpi_yoy?: number;
+  cpi_mom?: number;
+  source?: string;
+  note?: string;
+}) => postJSON<TextResponse>("/api/market/cpi-series", params);
+
+export type RateObservation = {
+  date: string;
+  refinance: number;
+  interbank_on?: number | null;
+  deposit_12m?: number | null;
+  source?: string;
+  note?: string;
+};
+
+export const rateSeriesRaw = () =>
+  getJSON<{ observations: RateObservation[] }>("/api/market/rate-series/raw");
+
+export const rateSeriesManage = (params: {
+  action: "list" | "add" | "remove" | "clear";
+  date?: string;
+  refinance?: number;
+  interbank_on?: number;
+  deposit_12m?: number;
+  source?: string;
+  note?: string;
+}) => postJSON<TextResponse>("/api/market/rate-series", params);
+
+export const macroPillars = () => getJSON<TextResponse>("/api/market/pillars");
+
+export const sectorRotation = (rank_by: "1M" | "3M" | "6M" | "YTD" = "3M") =>
+  getJSON<TextResponse>(`/api/market/sector-rotation?rank_by=${rank_by}`);
+
+export type SectorPeriod = "1M" | "3M" | "6M" | "YTD";
+export type TopTickerRow = {
+  ticker: string;
+  returns: Record<SectorPeriod, number | null>;
+  alpha_vs_vni: number | null;
+};
+export type TopSectorRow = {
+  name: string;
+  sector_returns: Record<SectorPeriod, number | null>;
+  alpha_vs_vni: number | null;
+  type: "cyclical" | "defensive" | "mixed";
+  tickers: TopTickerRow[];
+};
+export type TopTickersBySectorResponse = {
+  rank_by: SectorPeriod;
+  vni_returns: Record<SectorPeriod, number | null>;
+  sectors: TopSectorRow[];
+  error?: string;
+};
+
+export const topTickersBySector = (
+  rank_by: SectorPeriod = "3M",
+  top_sectors: number = 3,
+  top_tickers: number = 5,
+) => getJSON<TopTickersBySectorResponse>(
+  `/api/market/top-tickers-by-sector?rank_by=${rank_by}&top_sectors=${top_sectors}&top_tickers=${top_tickers}`
+);
+
+export const marketCycle = () => getJSON<TextResponse>("/api/market/cycle");
+
+export const loadMacroReport = (params: { source: string; save?: boolean; broker?: string; title?: string; language?: string }) =>
+  postJSON<TextResponse>("/api/macro/report", params);
+
+export const listMacroReports = (limit: number = 20) =>
+  getJSON<TextResponse>(`/api/macro/reports?limit=${limit}`);
+
+export type BrokerReport = {
+  id: number;
+  title_vi: string;
+  title_en?: string;
+  description?: string;
+  date: string;
+  pdf_url: string;
+  page_url: string;
+  broker: string;
+  broker_short: string;
+};
+export type BrokerFeedResponse = {
+  broker: string;
+  category: string;
+  total: number;
+  reports: BrokerReport[];
+};
+
+export const brokerMacroFeed = (limit: number = 10) =>
+  getJSON<BrokerFeedResponse>(`/api/broker/feed?broker=masvn&category=macro&limit=${limit}`);
+
+export const uploadMacroReport = async (params: {
+  file: File; save?: boolean; broker?: string; title?: string; language?: string;
+}): Promise<TextResponse> => {
+  const fd = new FormData();
+  fd.append("file", params.file);
+  if (params.save) fd.append("save", "true");
+  if (params.broker) fd.append("broker", params.broker);
+  if (params.title) fd.append("title", params.title);
+  if (params.language) fd.append("language", params.language);
+  const resp = await fetch(`${API_URL}/api/macro/report/upload`, { method: "POST", body: fd });
+  if (!resp.ok) throw new Error(`API ${resp.status}`);
+  return resp.json();
+};
 export const commodities = () => getJSON<TextResponse>("/api/market/commodities");
 
 // ── Risk & portfolio ─────────────────────────────────────────────────────────
@@ -290,7 +494,28 @@ export const stockOverviewData = (ticker: string) =>
   getJSON<OverviewData>(`/api/stock/overview-data?ticker=${ticker}`);
 
 export const stockIncomeTrend = (ticker: string) =>
-  getJSON<IncomeTrend>(`/api/stock/income-trend?ticker=${ticker}`);;
+  getJSON<IncomeTrend>(`/api/stock/income-trend?ticker=${ticker}`);
+
+export type ForeignFlowPoint    = { date: string; net_vol: number; net_val_b: number };
+export type ForeignFlowStatement = { text: string; isPass: boolean };
+export type ForeignFlowResponse  = { ticker: string; points: ForeignFlowPoint[]; statements: ForeignFlowStatement[] };
+
+export const stockForeignFlowChart = (ticker: string) =>
+  getJSON<ForeignFlowResponse>(`/api/stock/foreign-flow-chart?ticker=${ticker}`);
+
+export type ForeignNetAnnualPoint = { year: number; net_val_b: number; cum_val_b: number };
+export const stockForeignNetAnnual = (ticker: string) =>
+  getJSON<{ ticker: string; points: ForeignNetAnnualPoint[] }>(
+    `/api/stock/foreign-net-annual?ticker=${ticker}`,
+  );
+
+export const marketForeignNetAnnual = () =>
+  getJSON<{ ticker: string; points: ForeignNetAnnualPoint[] }>(
+    "/api/market/foreign-net-annual",
+  );
+
+export const marketForeignFlowChart = () =>
+  getJSON<ForeignFlowResponse>("/api/market/foreign-flow-chart");;
 
 // ── Knowledge layer (K6-K9) ────────────────────────────────────────────────
 

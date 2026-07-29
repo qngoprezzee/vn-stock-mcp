@@ -12,7 +12,11 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+import shutil
+import tempfile
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -208,6 +212,29 @@ class ReviewRequest(BaseModel):
     lookback_days: int = 365
 
 
+class MoneyFlowRequest(BaseModel):
+    ticker: str
+    days: int = 180
+
+
+class PortfolioActionRequest(BaseModel):
+    action: str
+    ticker: str = ""
+    shares: float | None = None
+    avg_cost: float | None = None
+    target_weight: float | None = None
+    cash_vnd: float | None = None
+    notes: str = ""
+
+
+class RebalanceRequest(BaseModel):
+    threshold_pct: float = 3.0
+
+
+class PortfolioReturnsRequest(BaseModel):
+    risk_free_rate: float = 4.0
+
+
 # ── Health + index ───────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -254,6 +281,28 @@ async def technical(req: TickerRequest) -> dict[str, str]:
     return {"text": _text(result)}
 
 
+@app.post("/api/stock/money-flow-price-action")
+async def money_flow_price_action(req: MoneyFlowRequest) -> dict[str, str]:
+    result = await server._get_money_flow_price_action(req.model_dump())
+    return {"text": _text(result)}
+
+
+class BrokerNewsRequest(BaseModel):
+    ticker: str
+    limit: int = 15
+
+
+@app.post("/api/stock/broker-news")
+async def broker_news_endpoint(req: BrokerNewsRequest) -> dict[str, str]:
+    result = await server._fetch_broker_news(req.model_dump())
+    # Combine any text items into a single markdown blob
+    parts: list[str] = []
+    for item in result:
+        if hasattr(item, "text"):
+            parts.append(item.text)
+    return {"text": "\n\n---\n\n".join(parts)}
+
+
 @app.post("/api/stock/dcf")
 async def dcf(req: DCFRequest) -> dict[str, str]:
     result = await server._get_dcf_valuation(req.model_dump())
@@ -280,6 +329,105 @@ async def economy_news(limit: int = 20) -> dict[str, str]:
     return {"text": _text(result)}
 
 
+@app.get("/api/market/news-data")
+async def market_news_data(limit: int = 50) -> dict:
+    from datetime import datetime, timezone, timedelta
+    articles = await server._get_economy_news_articles(limit)
+    vn_tz = timezone(timedelta(hours=7))
+    return {
+        "articles": articles,
+        "total": len(articles),
+        "sources_total": len(server._ECONOMY_FEEDS),
+        "generated_at": datetime.now(vn_tz).strftime("%Y-%m-%d %H:%M VNT"),
+    }
+
+
+_news_digest_cache: dict[str, Any] = {}
+
+
+@app.post("/api/market/news-digest")
+async def market_news_digest(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Summarize today's headlines into a one-page AI digest."""
+    import os as _os
+    from datetime import datetime, timezone, timedelta
+
+    api_key = _os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not set")
+
+    body = body or {}
+    limit = int(body.get("limit", 60))
+    force = bool(body.get("force", False))
+
+    articles = await server._get_economy_news_articles(limit)
+    if not articles:
+        raise HTTPException(status_code=503, detail="No articles available to digest")
+
+    cache_key = "news_digest_" + str(hash(tuple((a["source"], a["title"]) for a in articles)))
+    cached = _news_digest_cache.get(cache_key)
+    if not force and cached and time.time() - cached.get("_ts", 0) < 1800:
+        return cached
+
+    headline_lines = [
+        f"- [{a['source']}] {a['date']}: {a['title']}"
+        for a in articles
+    ]
+    headlines_blob = "\n".join(headline_lines)
+
+    try:
+        import openai as _openai
+        client = _openai.OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=900,
+            messages=[
+                {"role": "system", "content": (
+                    "You are a Vietnamese equity market analyst writing a one-page daily news digest. "
+                    "Group the supplied headlines into clear themes and explain what an investor should take away. "
+                    "Output MUST be Markdown with these sections, in order:\n\n"
+                    "## TL;DR\n"
+                    "One short paragraph (3-4 sentences) capturing the overall market mood and the biggest "
+                    "single story of the day.\n\n"
+                    "## Top Themes\n"
+                    "3-5 bullets. Each bullet starts with a **bold theme name** then 1-2 sentences explaining "
+                    "what's happening, which tickers/sectors are involved, and why it matters. Cite source names "
+                    "in brackets when relevant, e.g. [CafeF].\n\n"
+                    "## Stocks to Watch\n"
+                    "Bulleted list of specific tickers that appeared in the headlines with a one-line angle each. "
+                    "Skip this section if no individual tickers stand out.\n\n"
+                    "## Macro & Policy\n"
+                    "1-3 bullets on monetary, FX, regulation, or international macro stories that could affect "
+                    "VN equities. Skip if nothing relevant.\n\n"
+                    "## Risks / Watch-outs\n"
+                    "1-3 bullets on negative or cautionary stories.\n\n"
+                    "Write in concise, professional English. Vietnamese headlines should be translated/summarized "
+                    "in English. Do not invent facts not present in the headlines."
+                )},
+                {"role": "user", "content": (
+                    f"Today is {datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%d')} (Vietnam time).\n"
+                    f"Here are {len(articles)} latest headlines from {len(server._ECONOMY_FEEDS)} Vietnamese & "
+                    f"English financial news sources. Write the digest.\n\n"
+                    f"{headlines_blob}"
+                )},
+            ],
+        )
+        digest_md = resp.choices[0].message.content.strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    vn_tz = timezone(timedelta(hours=7))
+    result = {
+        "digest": digest_md,
+        "article_count": len(articles),
+        "sources_total": len(server._ECONOMY_FEEDS),
+        "generated_at": datetime.now(vn_tz).strftime("%Y-%m-%d %H:%M VNT"),
+        "model": "gpt-4o-mini",
+        "_ts": time.time(),
+    }
+    _news_digest_cache[cache_key] = result
+    return result
+
+
 @app.get("/api/market/macro-data")
 async def macro_data() -> dict[str, str]:
     result = await server._get_macro_data({})
@@ -290,6 +438,149 @@ async def macro_data() -> dict[str, str]:
 async def macro_indicators() -> dict[str, str]:
     result = await server._get_vn_macro_indicators({})
     return {"text": _text(result)}
+
+
+@app.get("/api/market/money-supply")
+async def money_supply() -> dict[str, str]:
+    result = await server._get_money_supply({})
+    return {"text": _text(result)}
+
+
+class M2SeriesActionRequest(BaseModel):
+    action: str
+    date: str = ""
+    value_trillion_vnd: float | None = None
+    source: str = ""
+    note: str = ""
+
+
+@app.post("/api/market/m2-series")
+async def m2_series_manage(req: M2SeriesActionRequest) -> dict[str, str]:
+    result = await server._manage_m2_series(req.model_dump())
+    return {"text": _text(result)}
+
+
+@app.get("/api/market/m2-series/raw")
+async def m2_series_raw() -> dict:
+    return {"observations": server._load_m2_series()}
+
+
+class CpiSeriesActionRequest(BaseModel):
+    action: str
+    date: str = ""
+    cpi_yoy: float | None = None
+    cpi_mom: float | None = None
+    source: str = ""
+    note: str = ""
+
+
+@app.post("/api/market/cpi-series")
+async def cpi_series_manage(req: CpiSeriesActionRequest) -> dict[str, str]:
+    result = await server._manage_cpi_series(req.model_dump())
+    return {"text": _text(result)}
+
+
+@app.get("/api/market/cpi-series/raw")
+async def cpi_series_raw() -> dict:
+    return {"observations": server._load_cpi_series()}
+
+
+class RateSeriesActionRequest(BaseModel):
+    action: str
+    date: str = ""
+    refinance: float | None = None
+    interbank_on: float | None = None
+    deposit_12m: float | None = None
+    source: str = ""
+    note: str = ""
+
+
+@app.post("/api/market/rate-series")
+async def rate_series_manage(req: RateSeriesActionRequest) -> dict[str, str]:
+    result = await server._manage_rate_series(req.model_dump())
+    return {"text": _text(result)}
+
+
+@app.get("/api/market/rate-series/raw")
+async def rate_series_raw() -> dict:
+    return {"observations": server._load_rate_series()}
+
+
+@app.get("/api/market/pillars")
+async def macro_pillars() -> dict[str, str]:
+    result = await server._get_macro_pillars({})
+    return {"text": _text(result)}
+
+
+@app.get("/api/market/sector-rotation")
+async def sector_rotation(rank_by: str = "3M") -> dict[str, str]:
+    result = await server._get_sector_rotation({"rank_by": rank_by})
+    return {"text": _text(result)}
+
+
+@app.get("/api/market/top-tickers-by-sector")
+async def top_tickers_by_sector(
+    rank_by: str = "3M",
+    top_sectors: int = 3,
+    top_tickers: int = 5,
+) -> dict:
+    return await server._get_top_tickers_by_sector({
+        "rank_by": rank_by,
+        "top_sectors": top_sectors,
+        "top_tickers": top_tickers,
+    })
+
+
+@app.get("/api/market/cycle")
+async def market_cycle() -> dict[str, str]:
+    result = await server._get_market_cycle({})
+    return {"text": _text(result)}
+
+
+class MacroReportRequest(BaseModel):
+    source: str
+    save: bool = False
+    broker: str = ""
+    title: str = ""
+    language: str = "vi"
+
+
+@app.post("/api/macro/report")
+async def macro_report_load(req: MacroReportRequest) -> dict[str, str]:
+    result = await server._load_macro_report(req.model_dump())
+    return {"text": _text(result)}
+
+
+@app.get("/api/macro/reports")
+async def macro_reports_list(limit: int = 20) -> dict[str, str]:
+    result = await server._list_macro_reports({"limit": limit})
+    return {"text": _text(result)}
+
+
+@app.post("/api/macro/report/upload")
+async def macro_report_upload(
+    file:     UploadFile = File(...),
+    save:     bool = Form(False),
+    broker:   str = Form(""),
+    title:    str = Form(""),
+    language: str = Form("vi"),
+) -> dict[str, Any]:
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Must be a .pdf file")
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+    try:
+        result = await server._load_macro_report({
+            "source": tmp_path,
+            "save": save,
+            "broker": broker,
+            "title": title or file.filename,
+            "language": language,
+        })
+        return {"text": _text(result)}
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 @app.get("/api/market/commodities")
@@ -310,6 +601,46 @@ async def position_sizing(req: PositionSizingRequest) -> dict[str, str]:
 async def stress_test(req: StressTestRequest) -> dict[str, str]:
     result = await server._stress_test_portfolio({"holdings": [h.model_dump() for h in req.holdings]})
     return {"text": _text(result)}
+
+
+@app.post("/api/portfolio/manage")
+async def portfolio_manage(req: PortfolioActionRequest) -> dict[str, str]:
+    result = await server._manage_portfolio(req.model_dump(exclude_none=True))
+    return {"text": _text(result)}
+
+
+@app.get("/api/portfolio/overview")
+async def portfolio_overview() -> dict[str, str]:
+    result = await server._get_portfolio_overview({})
+    return {"text": _text(result)}
+
+
+@app.get("/api/portfolio/risk")
+async def portfolio_risk() -> dict[str, str]:
+    result = await server._get_portfolio_risk({})
+    return {"text": _text(result)}
+
+
+@app.post("/api/portfolio/rebalance")
+async def portfolio_rebalance(req: RebalanceRequest) -> dict[str, str]:
+    result = await server._get_rebalancing_suggestions(req.model_dump())
+    return {"text": _text(result)}
+
+
+@app.get("/api/portfolio/raw")
+async def portfolio_raw() -> dict:
+    return server._load_portfolio()
+
+
+@app.post("/api/portfolio/returns")
+async def portfolio_returns(req: PortfolioReturnsRequest) -> dict[str, str]:
+    result = await server._get_portfolio_returns(req.model_dump())
+    return {"text": _text(result)}
+
+
+@app.get("/api/portfolio/snapshots")
+async def portfolio_snapshots() -> dict:
+    return {"snapshots": server._load_snapshots()}
 
 
 # ── Knowledge (K6-K9) ──────────────────────────────────────────────────────
@@ -644,6 +975,243 @@ async def stock_chart_data(ticker: str, days: int = 90) -> dict[str, Any]:
     return {"ticker": ticker.upper(), "prices": prices}
 
 
+_foreign_flow_cache: dict[str, Any] = {}
+_FOREIGN_FLOW_TTL = 300  # 5 minutes
+_FLOW_STORE_DIR   = server.Path(__file__).parent / "analyses" / "foreign_flow"
+_SIMPLIZE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Accept": "application/json",
+    "Referer": "https://simplize.vn",
+    "Origin": "https://simplize.vn",
+}
+
+
+def _flow_store_path(key: str) -> server.Path:
+    _FLOW_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    return _FLOW_STORE_DIR / f"{key}.json"
+
+
+def _load_flow_store(key: str) -> dict[str, Any]:
+    path = _flow_store_path(key)
+    if not path.exists():
+        return {}
+    try:
+        return _json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_flow_store(key: str, points: list[dict]) -> None:
+    existing = _load_flow_store(key)
+    by_date: dict[str, dict] = {p["date"]: p for p in existing.get("points", [])}
+    for p in points:
+        by_date[p["date"]] = p
+    merged = sorted(by_date.values(), key=lambda x: x["date"])
+    _flow_store_path(key).write_text(
+        _json.dumps({"points": merged}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _parse_simplize_items(items: list) -> list[dict]:
+    from datetime import datetime as _dt
+    points = []
+    for item in items:
+        try:
+            date_str  = _dt.strptime(item["date"], "%d/%m/%Y").strftime("%Y-%m-%d")
+            net_val_b = round(float(item["totalBuySellValue"]) / 1e9, 2)
+            net_vol   = round(float(item["buyQtt"]) - float(item["sellQtt"]))
+            points.append({"date": date_str, "net_vol": net_vol, "net_val_b": net_val_b})
+        except (KeyError, ValueError):
+            continue
+    return points
+
+
+_VCI_IQ = "https://iq.vietcap.com.vn/api/iq-insight-service"
+_annual_flow_cache: dict[str, Any] = {}
+_ANNUAL_FLOW_TTL = 3600  # 1 hour
+_VCI_IQ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+    "Referer": "https://trading.vietcap.com.vn/",
+    "Origin": "https://trading.vietcap.com.vn",
+}
+
+
+@app.get("/api/stock/foreign-net-annual")
+async def foreign_net_annual(ticker: str) -> dict[str, Any]:
+    """Annual net foreign buy/sell (B VND) from VCI IQ insight service, 2019 → present."""
+    import httpx as _httpx
+
+    ticker = ticker.upper()
+    cached = _annual_flow_cache.get(ticker)
+    if cached and time.time() - cached["_ts"] < _ANNUAL_FLOW_TTL:
+        return cached
+
+    async with _httpx.AsyncClient(follow_redirects=True) as client:
+        r = await client.get(
+            f"{_VCI_IQ}/v1/company/{ticker}/foreign-net",
+            headers=_VCI_IQ_HEADERS, timeout=10,
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=f"VCI IQ returned {r.status_code}")
+
+    rows = r.json().get("data") or []
+    points = []
+    for row in rows:
+        try:
+            points.append({
+                "year":       int(row["year"]),
+                "net_val_b":  round(float(row["foreignNet"]) / 1e9, 1),
+                "cum_val_b":  round(float(row["cumulativeNet"]) / 1e9, 1),
+            })
+        except (KeyError, ValueError):
+            continue
+
+    points.sort(key=lambda x: x["year"])
+    result = {"ticker": ticker, "points": points, "_ts": time.time()}
+    _annual_flow_cache[ticker] = result
+    return result
+
+
+@app.get("/api/market/foreign-net-annual")
+async def market_foreign_net_annual() -> dict[str, Any]:
+    """Annual net foreign buy/sell (B VND) aggregated across VN30 basket from VCI IQ, 2019 → present."""
+    import httpx as _httpx
+    from collections import defaultdict as _dd
+
+    cached = _annual_flow_cache.get("__market_annual__")
+    if cached and time.time() - cached["_ts"] < _ANNUAL_FLOW_TTL:
+        return cached
+
+    async def _fetch(client: _httpx.AsyncClient, ticker: str) -> list:
+        try:
+            r = await client.get(
+                f"{_VCI_IQ}/v1/company/{ticker}/foreign-net",
+                headers=_VCI_IQ_HEADERS, timeout=8,
+            )
+            return r.json().get("data") or [] if r.status_code == 200 else []
+        except Exception:
+            return []
+
+    async with _httpx.AsyncClient(follow_redirects=True) as client:
+        all_rows = await asyncio.gather(*[_fetch(client, t) for t in _VN30_BASKET])
+
+    agg: dict[int, float] = _dd(float)
+    for rows in all_rows:
+        for row in rows:
+            try:
+                agg[int(row["year"])] += float(row["foreignNet"])
+            except (KeyError, ValueError):
+                continue
+
+    # Build cumulative
+    points = []
+    cum = 0.0
+    for year in sorted(agg):
+        net = round(agg[year] / 1e9, 1)
+        cum += net
+        points.append({"year": year, "net_val_b": net, "cum_val_b": round(cum, 1)})
+
+    result = {"ticker": "VN30-AGG", "points": points, "_ts": time.time()}
+    _annual_flow_cache["__market_annual__"] = result
+    return result
+
+
+@app.get("/api/stock/foreign-flow-chart")
+async def foreign_flow_chart(ticker: str) -> dict[str, Any]:
+    """Historical net foreign buy/sell value (B VND). Fetches latest 10 sessions from Simplize
+    and merges into a persistent local store so history accumulates across calls."""
+    import httpx as _httpx
+
+    ticker = ticker.upper()
+    cached = _foreign_flow_cache.get(ticker)
+    if cached and time.time() - cached["_ts"] < _FOREIGN_FLOW_TTL:
+        return cached
+
+    async with _httpx.AsyncClient(follow_redirects=True) as client:
+        r = await client.get(
+            f"https://api2.simplize.vn/api/historical/foreign/trade/{ticker}",
+            headers=_SIMPLIZE_HEADERS, timeout=10,
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=f"Simplize returned {r.status_code}")
+
+    payload    = r.json().get("data", {})
+    fresh      = _parse_simplize_items(payload.get("items", []))
+    statements = [{"text": s["description"], "isPass": s["isPass"]} for s in payload.get("statements", [])]
+
+    _save_flow_store(ticker, fresh)
+    all_points = _load_flow_store(ticker).get("points", fresh)
+
+    result = {"ticker": ticker, "points": all_points, "statements": statements, "_ts": time.time()}
+    _foreign_flow_cache[ticker] = result
+    return result
+
+
+_VN30_BASKET = [
+    "VCB","BID","CTG","TCB","MBB","VPB","ACB","STB","SHB","HDB",
+    "VIC","VHM","VRE","HPG","GAS","PLX","FPT","MWG","VNM","SAB",
+    "MSN","VJC","REE","BVH","VND","SSI","HCM","NVL","PDR","POW",
+]
+
+_mkt_flow_cache: dict[str, Any] = {}
+
+
+@app.get("/api/market/foreign-flow-chart")
+async def market_foreign_flow_chart() -> dict[str, Any]:
+    """Net foreign flow aggregated across VN30 basket (B VND). Fetches latest ~10 sessions and
+    merges into a persistent store so history accumulates across calls."""
+    import httpx as _httpx
+    from collections import defaultdict as _dd
+
+    cached = _mkt_flow_cache.get("market")
+    if cached and time.time() - cached["_ts"] < _FOREIGN_FLOW_TTL:
+        return cached
+
+    async def _fetch(client: _httpx.AsyncClient, ticker: str) -> list:
+        try:
+            r = await client.get(
+                f"https://api2.simplize.vn/api/historical/foreign/trade/{ticker}",
+                headers=_SIMPLIZE_HEADERS, timeout=8,
+            )
+            return r.json().get("data", {}).get("items", []) if r.status_code == 200 else []
+        except Exception:
+            return []
+
+    async with _httpx.AsyncClient(follow_redirects=True) as client:
+        all_items = await asyncio.gather(*[_fetch(client, t) for t in _VN30_BASKET])
+
+    # Aggregate fresh data by date across all tickers
+    agg: dict[str, float] = _dd(float)
+    for items in all_items:
+        for p in _parse_simplize_items(items):
+            agg[p["date"]] += p["net_val_b"]
+
+    fresh = [{"date": d, "net_vol": 0, "net_val_b": round(v, 2)} for d, v in agg.items()]
+    _save_flow_store("__market__", fresh)
+    all_points = _load_flow_store("__market__").get("points", fresh)
+
+    statements: list[dict] = []
+    if all_points:
+        last      = all_points[-1]
+        total     = sum(p["net_val_b"] for p in all_points)
+        direction = "net bought" if last["net_val_b"] >= 0 else "net sold"
+        statements.append({
+            "text": f"Foreigners {direction} {abs(last['net_val_b']):.1f}B VND across VN30 in the last session ({last['date']})",
+            "isPass": last["net_val_b"] >= 0,
+        })
+        n         = len(all_points)
+        total_dir = "net bought" if total >= 0 else "net sold"
+        statements.append({
+            "text": f"Cumulative over {n} sessions tracked: foreigners {total_dir} {abs(total):.1f}B VND across VN30",
+            "isPass": total >= 0,
+        })
+
+    result = {"ticker": "VN30-AGG", "points": all_points, "statements": statements, "_ts": time.time()}
+    _mkt_flow_cache["market"] = result
+    return result
+
+
 @app.get("/api/stock/overview-data")
 async def stock_overview_data(ticker: str) -> dict[str, Any]:
     """Company overview as structured metrics — name, price, market cap, 52W range, etc."""
@@ -849,8 +1417,7 @@ ANALYSES_DIR = server.ANALYSES_DIR
 MASVN_CATEGORIES = {
     "weekly": 23,
     "daily":  22,
-    "sector": 31,
-    "macro":  25,
+    "macro":  28,
 }
 _broker_feed_cache: dict[str, Any] = {}
 _BROKER_FEED_TTL = 1800  # 30 min

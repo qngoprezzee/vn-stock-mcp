@@ -1,14 +1,19 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { createChart, AreaSeries } from "lightweight-charts";
 import { TrendingUp, TrendingDown, RefreshCw, Newspaper } from "lucide-react";
-import { marketDashboardData, marketIndexChart, economyNews } from "@/lib/api";
-import type { DashboardData, IndexInfo, Mover, IndexPrice } from "@/lib/api";
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid,
+  Tooltip, ResponsiveContainer, ReferenceLine, Cell,
+} from "recharts";
+import { marketDashboardData, marketIndexChart, economyNews, marketForeignFlowChart, marketForeignNetAnnual } from "@/lib/api";
+import { AnnualFlowChart } from "@/components/AnnualFlowChart";
+import type { DashboardData, IndexInfo, Mover, IndexPrice, ForeignFlowResponse } from "@/lib/api";
 
-const fmt    = (n: number, d = 2) => n.toLocaleString("vi-VN", { minimumFractionDigits: d, maximumFractionDigits: d });
-const fmtVol = (n: number) => n >= 1e9 ? `${(n/1e9).toFixed(1)}B` : n >= 1e6 ? `${(n/1e6).toFixed(0)}M` : `${(n/1e3).toFixed(0)}K`;
+const fmt    = (n: number | undefined, d = 2) => (n ?? 0).toLocaleString("vi-VN", { minimumFractionDigits: d, maximumFractionDigits: d });
+const fmtVol = (n: number | undefined) => !n ? "—" : n >= 1e9 ? `${(n/1e9).toFixed(1)}B` : n >= 1e6 ? `${(n/1e6).toFixed(0)}M` : `${(n/1e3).toFixed(0)}K`;
 
 function ChangeTag({ pct, pts }: { pct: number; pts?: number }) {
   const up = pct >= 0;
@@ -183,9 +188,11 @@ function NewsStrip({ text }: { text: string }) {
 export default function Dashboard() {
   const [chartDays, setChartDays] = useState(365);
 
-  const dashboard = useQuery({ queryKey: ["dashboard"], queryFn: marketDashboardData, refetchInterval: 60_000 });
-  const chart     = useQuery({ queryKey: ["index-chart", chartDays], queryFn: () => marketIndexChart("VNINDEX", chartDays) });
-  const news      = useQuery({ queryKey: ["economy-news"], queryFn: () => economyNews(20) });
+  const dashboard   = useQuery({ queryKey: ["dashboard"],           queryFn: marketDashboardData,  refetchInterval: 60_000 });
+  const chart       = useQuery({ queryKey: ["index-chart", chartDays], queryFn: () => marketIndexChart("VNINDEX", chartDays) });
+  const news        = useQuery({ queryKey: ["economy-news"],        queryFn: () => economyNews(20) });
+  const marketFlow        = useQuery({ queryKey: ["market-foreign-flow"],        queryFn: marketForeignFlowChart });
+  const marketAnnualFlow  = useQuery({ queryKey: ["market-foreign-net-annual"],  queryFn: marketForeignNetAnnual });
 
   if (dashboard.isLoading) return (
     <div className="flex items-center gap-2 text-slate-500 py-20 justify-center">
@@ -262,6 +269,112 @@ export default function Dashboard() {
           ? ` · refreshed ${data.movers_age_s < 60 ? `${data.movers_age_s}s` : `${Math.round(data.movers_age_s / 60)}m`} ago`
           : " · loading initial scan…"}
       </p>
+
+      {/* Market annual foreign flow — VN30 aggregated, 2019-present */}
+      {marketAnnualFlow.isLoading && (
+        <div className="flex items-center gap-2 text-slate-500 text-sm">
+          <RefreshCw size={14} className="animate-spin" /> Loading market annual foreign flow…
+        </div>
+      )}
+      {marketAnnualFlow.data && marketAnnualFlow.data.points.length > 0 && (
+        <AnnualFlowChart
+          ticker="VN30"
+          points={marketAnnualFlow.data.points}
+          subtitle="VCI · Aggregated across 30 large-caps"
+        />
+      )}
+
+      {/* Market daily foreign flow */}
+      {marketFlow.isLoading && (
+        <div className="flex items-center gap-2 text-slate-500 text-sm">
+          <RefreshCw size={14} className="animate-spin" /> Loading market foreign flow…
+        </div>
+      )}
+      {marketFlow.data && marketFlow.data.points.length > 0 && (
+        <MarketFlowChart data={marketFlow.data} />
+      )}
     </div>
+  );
+}
+
+const FLOW_PERIODS = [
+  { label: "1M",  days: 21 },
+  { label: "3M",  days: 63 },
+  { label: "All", days: Infinity },
+];
+
+function MarketFlowChart({ data }: { data: ForeignFlowResponse }) {
+  const [period, setPeriod] = useState(FLOW_PERIODS[2]);
+  const fmt = (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}B`;
+
+  const visible = period.days === Infinity ? data.points : data.points.slice(-period.days);
+
+  return (
+    <Card className="p-5 space-y-4">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <h3 className="font-semibold text-slate-800 dark:text-white">VN30 — Net Foreign Flow (B VND)</h3>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Aggregated across 30 large-caps &nbsp;·&nbsp; Green = net buy &nbsp;·&nbsp; Red = net sell
+            &nbsp;·&nbsp; <span className="text-slate-400">
+              {data.points.length} sessions stored
+              {data.points.length < 60 && " — history grows each visit"}
+            </span>
+          </p>
+        </div>
+        <div className="flex gap-1 shrink-0">
+          {FLOW_PERIODS.map(p => (
+            <button key={p.label} onClick={() => setPeriod(p)}
+              className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                period.label === p.label
+                  ? "bg-slate-800 dark:bg-slate-600 text-white"
+                  : "text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-700"
+              }`}>
+              {p.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <ResponsiveContainer width="100%" height={200}>
+        <BarChart data={visible} margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+          <XAxis
+            dataKey="date"
+            tick={{ fontSize: 10 }}
+            tickFormatter={(d: string) => d.slice(5)}
+            interval="preserveStartEnd"
+          />
+          <YAxis
+            tickFormatter={(v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(0)}B`}
+            tick={{ fontSize: 11 }}
+            width={56}
+          />
+          <ReferenceLine y={0} stroke="#94a3b8" />
+          <Tooltip
+            formatter={(value) => [fmt(Number(value ?? 0)), "Net value"]}
+            labelFormatter={(label) => `Date: ${String(label)}`}
+          />
+          <Bar dataKey="net_val_b" radius={[2, 2, 0, 0]}>
+            {visible.map((pt, i) => (
+              <Cell key={i} fill={pt.net_val_b >= 0 ? "#10b981" : "#ef4444"} />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+
+      {data.statements.length > 0 && (
+        <ul className="space-y-1.5">
+          {data.statements.map((s, i) => (
+            <li key={i} className="flex items-start gap-2 text-xs text-slate-600 dark:text-slate-400">
+              <span className={`mt-0.5 shrink-0 font-bold ${s.isPass ? "text-emerald-500" : "text-red-500"}`}>
+                {s.isPass ? "▲" : "▼"}
+              </span>
+              {s.text}
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
   );
 }
